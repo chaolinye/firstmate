@@ -13,6 +13,19 @@ FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
 # confirm and 0.5s attach polls, and forking uname per call is a measurable cost on
 # the platform (Git Bash/MSYS) that already pays the highest fork price.
 _FM_UNAME=$(uname 2>/dev/null || echo unknown)
+# Git Bash/MSYS: the MSYS runtime's ln -s defaults to COPYING the target (and
+# readlink returns nothing, [ -L ] is false), which silently breaks every
+# symlink-based lock primitive this file owns. MSYS=winsymlinks:native makes
+# ln -s create a real symlink without admin rights (nativestrict needs
+# elevation). It is read per ln -s invocation, so exporting it here - after
+# process start - still takes effect for every lock this library acquires.
+# Capability detection must not key on uname alone (fm_pid_identity's /proc
+# contract), but symlink behavior is exactly a runtime capability: only the
+# MSYS family presents this copy-fallback, and the same export is harmless on
+# Linux/macOS where MSYS is unused.
+case "$_FM_UNAME" in
+  MINGW* | MSYS* | CYGWIN*) export MSYS="${MSYS:+$MSYS:}winsymlinks:native" ;;
+esac
 mkdir -p "$STATE"
 
 # Most wake-library consumers need only queue and lock primitives, including
@@ -144,6 +157,17 @@ fm_watcher_lock_matches_pid() {
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
+  # Git Bash/MSYS: the watcher writes $FM_HOME and its own script path in the
+  # same Windows-style form it inherited (D:\Code\...), while the health
+  # caller passes POSIX form (/d/Code/...). Normalize both sides so the
+  # comparison is format-independent. cygpath is harmless elsewhere because
+  # these helper paths are already POSIX there and pass through unchanged.
+  if command -v cygpath >/dev/null 2>&1; then
+    lock_home=$(cygpath -u "$lock_home" 2>/dev/null || printf '%s' "$lock_home")
+    home=$(cygpath -u "$home" 2>/dev/null || printf '%s' "$home")
+    lock_path=$(cygpath -u "$lock_path" 2>/dev/null || printf '%s' "$lock_path")
+    watch_path=$(cygpath -u "$watch_path" 2>/dev/null || printf '%s' "$watch_path")
+  fi
   [ "$lock_home" = "$home" ] || return 1
   [ "$lock_path" = "$watch_path" ] || return 1
   [ -n "$lock_identity" ] || return 1

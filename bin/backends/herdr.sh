@@ -835,6 +835,19 @@ fm_backend_herdr_canonical_socket_path() {  # <socket-path>
   [ -n "$socket" ] || return 1
   case "$socket" in
     /*) ;;
+    # Git Bash/MSYS: herdr injects and reports Windows-style socket paths
+    # (C:\Users\...\herdr.sock), while this canonicalizer and its callers
+    # compare POSIX paths. Convert via cygpath when available so both the
+    # injected claimed socket and the session-listed socket normalize to the
+    # same form. The herdr CLI itself resolves either form, so only the
+    # comparison needs the conversion.
+    [A-Za-z]:\\*)
+      if command -v cygpath >/dev/null 2>&1; then
+        socket=$(cygpath -u "$socket" 2>/dev/null) || return 1
+      else
+        return 1
+      fi
+      ;;
     *) return 1 ;;
   esac
   sock_dir=$(dirname "$socket")
@@ -2954,9 +2967,25 @@ fm_backend_herdr_target_ready() {  # <target>
 # process's cwd instead, which is what changes when `treehouse get` enters its
 # worktree subshell - confirmed live against a real treehouse acquisition.
 fm_backend_herdr_current_path() {  # <target>
+  local path title
   fm_backend_herdr_target_ready "$1" || return 0
-  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
-    | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+  path=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
+    | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null)
+  if [ -z "$path" ]; then
+    # Windows/Git Bash herdr: the pane's cwd field stays at the launch path
+    # and foreground_cwd is absent, while the terminal title tracks the real
+    # shell location (observed when treehouse get cd's into a worktree).
+    # Fall back to the title only when it names a filesystem path, so a
+    # window title that is an application name or a shell prompt is never
+    # mistaken for a cwd.
+    title=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
+      | jq -r '.result.pane.terminal_title // empty' 2>/dev/null)
+    case "$title" in
+      /* | [A-Za-z]:[\\/]*) printf '%s\n' "$title" ;;
+    esac
+  else
+    printf '%s\n' "$path"
+  fi
 }
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,

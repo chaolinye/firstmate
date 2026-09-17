@@ -221,6 +221,29 @@ function lockOwnership(): LockOwnership {
     return "missing";
   }
   if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return "other";
+  // Native Windows: the lock holds a Cygwin pid, while process.kill and ps
+  // (the ancestry walk below) speak Windows pids, so the pid-based checks
+  // can never recognize this session's own lock. Delegate the membership
+  // question to the bash lock lib, which converts and matches on the MSYS
+  // identity (HERDR pane runtime id + pi bundle cmdline). This mirrors how
+  // every other Bash helper runs here on Windows.
+  if (process.platform === "win32") {
+    try {
+      const result = spawnSync(
+        "bash",
+        ["-lc", `. "$FM_ROOT_OVERRIDE/bin/fm-session-lock-lib.sh" && fm_session_lock_owned_by_self "$FM_STATE_OVERRIDE"`],
+        {
+          cwd: fmRoot,
+          encoding: "utf8",
+          env: { ...process.env, FM_HOME: fmHome, FM_STATE_OVERRIDE: state, FM_ROOT_OVERRIDE: fmRoot },
+        },
+      );
+      if (result.status === 0) return "owned";
+    } catch {
+      // fall through to the pid-based checks
+    }
+    return pidAlive(lockPid) ? "other" : "missing";
+  }
   let pid = String(process.pid);
   for (let i = 0; i < 8; i += 1) {
     if (pid === lockPid) return "owned";
