@@ -804,8 +804,18 @@ fm_backend_herdr_presentation_lock_namespace_valid() {
   [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
   expected_uid=$(id -u 2>/dev/null) || return 1
   owner=$(fm_backend_herdr_presentation_lock_namespace_uid "$dir") || return 1
+  [ "$owner" = "$expected_uid" ] || return 1
+  # Git Bash/MSYS cannot report POSIX modes: stat -c '%a' always prints 644
+  # for files and 755 for directories regardless of the real ACL, so a strict
+  # mode-700 requirement can never pass there and would block every herdr
+  # teardown. The namespace lives under the user's own temp directory, so
+  # ownership (checked above) is the meaningful privacy boundary on that
+  # platform; keep the strict check everywhere else.
+  case "$(uname 2>/dev/null || echo unknown)" in
+    MINGW* | MSYS* | CYGWIN*) return 0 ;;
+  esac
   mode=$(fm_backend_herdr_presentation_lock_namespace_mode "$dir") || return 1
-  [ "$owner" = "$expected_uid" ] && [ "$mode" = 700 ]
+  [ "$mode" = 700 ]
 }
 
 # Resolve the one verified running named-session socket path as an absolute
