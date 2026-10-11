@@ -32,6 +32,23 @@ GitHub Actions and Dependabot are exempt so their automation keeps working, but 
 
 See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/start-here/quick-start/) for the full first-run walkthrough.
 
+## Maintaining required checks
+
+GitHub required checks are configured in the repository's existing main ruleset, not activated by committing workflow YAML.
+When applying this CI layout, preserve its existing pull-request, merge-method, linear-history, deletion, non-fast-forward, and administrator-bypass settings.
+Add required status checks with `strict_required_status_checks_policy: false`; a main update alone must not force a branch update and retest.
+Bind the checks to the GitHub Actions app already producing them, rather than accepting the same context from any integration.
+No new app installation or manual runner setup is needed for that setting.
+
+Require the actual job contexts: `Lint 1`, `Lint 2`, `Test coverage guard`, `Repo invariants`, `Stock macOS Bash snapshot compatibility`, `Behavior portable parallel 1`, `Behavior portable parallel 2`, `Behavior portable serial 1` through `Behavior portable serial 9`, `Behavior tests (Herdr)`, `Behavior timing aggregate`, and `PR must be raised via no-mistakes`.
+The last name is the compliance job context, not its workflow title; its existing automation exceptions remain unchanged.
+The timing aggregate is not a substitute for individual jobs because it can succeed while collecting evidence from a failed run.
+
+Apply the approved rule change only after the corresponding workflow is green and landed, confirming exact names and the Actions integration id from real checks first.
+Snapshot the current ruleset, amend that same rule with the authenticated GitHub API or settings UI, and read back both the ruleset and effective branch rules.
+Verify missing or red checks prevent ordinary merging without creating a test merge; administrator override intentionally remains available.
+Coordinate any workflow rollback with its required-check names so a retired check cannot leave ordinary merges waiting forever.
+
 ## Repo conventions
 
 - This repo is a template for running a firstmate orchestrator agent.
@@ -48,7 +65,9 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
 - Helper scripts in `bin/` are plain bash.
   Each starts with a usage header comment; keep it accurate when you change behavior.
   Test scripts and helpers in `tests/` are plain bash too.
-  `bin/fm-lint.sh` must pass: it is the single owner of the lint definition (the shellcheck file set, config, pinned shellcheck version, pinned actionlint workflow lint, and the backend-purity check rejecting direct Beads CLI calls in core `bin/` scripts), and both CI and the no-mistakes pre-push gate invoke it with no arguments.
+  `bin/fm-lint.sh` must pass: it is the single owner of the lint definition (the shellcheck file set, config, pinned shellcheck version, pinned actionlint workflow lint, and the backend-purity check rejecting direct Beads CLI calls in core `bin/` scripts).
+  CI uses its full canonical partitions; the no-mistakes pre-push gate uses its context-selected default.
+  `docs/fm-test-portable-shards.md` owns partition verification and performance evidence.
   Its header and `--help` output own the exact local lint modes, file-set selection, and analysis flags.
   A malformed `.github/workflows/*.yml`, including a self-broken `ci.yml`, fails that local lint path before merge because a broken workflow cannot report its own breakage.
   It pins one exact shellcheck version and one exact actionlint version and refuses to run under any other.
@@ -116,7 +135,7 @@ Those sleeps look like recoverable overhead - `fm-watch-triage.test.sh` alone is
 Sampling less often does not remove that wait, it only delays detection: raising the interval to 0.5s and charging each sample proportionally measured `fm-watch-triage.test.sh` at 435s and 440s against 390s and 393s for the unchanged script, back to back on 2026-09-03, because each of its ~40 poll-cycle waits and ~73 process-exit waits paid up to half a second more.
 Some of those loops are also catching a transient rather than waiting for a settled condition, so a coarser sample can step over the state they assert on.
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so pass one to `bin/fm-test-run.sh` to focus on a subject with canonical timing output.
-Shared test helpers live in `tests/lib.sh` (reporters, temp roots, git fixtures), `tests/fixtures.sh` (fake toolchain and spawn-world builders), `tests/wake-helpers.sh`, `tests/secondmate-helpers.sh`, and `tests/git-config-helpers.sh` (fixture Git isolation from the host's global and system configuration, already sourced by `tests/lib.sh` and `tests/herdr-test-safety.sh`; a suite that sources neither must source it itself before its first Git operation so a direct invocation stays isolated).
+Shared test helpers live in `tests/lib.sh` (reporters, temp roots, git fixtures), `tests/fixtures.sh` (fake toolchain and spawn-world builders), `tests/wake-helpers.sh`, `tests/secondmate-helpers.sh`, and `tests/git-config-helpers.sh` (fixture Git isolation from the host's global and system configuration and from an inherited repository location such as `GIT_DIR`, already sourced by `tests/lib.sh` and `tests/herdr-test-safety.sh`; a suite that sources neither must source it itself before its first Git operation so a direct invocation stays isolated).
 Source those instead of copying a fake toolchain into a new suite.
 A fixture may shorten a production timeout to keep a failure path prompt, but never below what the real work inside that window costs on a loaded machine: a fork, an exec, a lock acquisition, a beacon publication, or a first-poll check.
 Where a case's assertion is not about the timeout itself, give that window headroom over the measured loaded cost, and bound the test's own waiting with iteration-counted poll loops, which stretch under load where a wall-clock budget does not.

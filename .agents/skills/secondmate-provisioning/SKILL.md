@@ -115,13 +115,17 @@ Inheritance copies the literal `config/crew-harness` file, so a secondmate's own
 Inherited `config/backend` becomes that secondmate home's local runtime-backend default for future spawns only; it never retargets, rewrites, migrates, stops, or restarts an already-live worker endpoint.
 A present primary value always converges byte-exact into validated secondmate homes, and primary absence removes the destination so those homes keep runtime auto-detection.
 Explicit per-spawn `--backend` and `FM_BACKEND` remain stronger than every home's local `config/backend`, including an inherited default.
+The declared `config/supervision-host-off` opt-out follows the same primary-authoritative propagation: its presence opts secondmate homes out even if they have their own engine setting, and its absence removes their copy at convergence.
+`config/supervision-host` itself is not inherited; each home selects its own engine.
 `config/secondmate-harness` is not inherited because it is only the primary's knob for launching secondmate agents.
+`config/claude-account` and `config/pi-account` are not inherited: a local secondmate agent launches on the launching home's worker account pin, and a secondmate home that should pin its own workers needs its own file ([`docs/configuration.md`](../../../docs/configuration.md) "Worker account pin").
 `data/captain-shared.md` is main-authoritative in the primary home and read-only in secondmate homes.
 Its primary file header must state that the file is main-authoritative, read-only in secondmate homes, must not be edited there, and that new captain-preference discoveries are routed to the main firstmate through marked status or a document pointer.
 Every propagation point converges the secondmate copy to the primary bytes; when the primary file is absent, any existing secondmate copy is quarantined and removed so absence converges too.
+Both the local helper and the remote receiver compare the destination against the generation each last published there, so an untouched inherited copy is replaced quietly instead of being reported as drift.
+A destination matching neither the primary bytes nor that recorded generation is quarantined to a collision-safe private dated sibling file before replacement, with a `SECONDMATE_SYNC:` diagnostic naming the home and quarantine artifact on the local route, so genuine local edits and interrupted publication keep a recovery copy.
 The helper rejects unsafe directories, symlinked or nonordinary source or destination artifacts, and hardlinked destination files.
 Between propagation runs, the secondmate copy is filesystem read-only; the helper may make its owned destination writable only around a guarded update and restores read-only mode on success, unchanged bytes, and recoverable failure paths.
-Before replacing divergent secondmate bytes, the helper hash-compares source and destination, quarantines the secondmate-local version to a collision-safe private dated sibling file, and emits a `SECONDMATE_SYNC:` diagnostic naming the home and quarantine artifact.
 Never copy any secondmate `data/captain-shared.md` back into the primary.
 Keep each home's `data/captain.md` domain-local.
 After first propagation to an existing home, trim that home's local `data/captain.md` by hand to domain-specific content plus pointers to `data/captain-shared.md`; do not automate or silently delete private content.
@@ -226,7 +230,8 @@ Respawn re-resolves the secondmate harness from current config, uses the same gu
 If the secondmate is already running and only inherited local material changed, prefer `bin/fm-config-push.sh` over respawning.
 To move a live LOCAL secondmate onto a newly pinned harness, model, or effort without a full recovery, set `config/secondmate-harness` and then relaunch it with `bin/fm-control.sh <id> relaunch`, which re-resolves that pin, stops the agent, and launches the replacement in the same home ([`docs/agent-control.md`](../../../docs/agent-control.md)).
 That plane refuses a remotely placed secondmate by name, because its agent runs on another host where none of the plane's postconditions can be read.
-Move a REMOTE one with `bin/fm-on.sh <id> fm-remote-secondmate-control.sh relaunch <id> <harness> <model|default|-> <effort|default|->`, which runs that same control-plane relaunch on its host; pass the profile explicitly and use `default` for an absent pin, because `config/secondmate-harness` is not inherited and the copy on that host belongs to a different home ([`docs/remote-secondmates.md`](../../../docs/remote-secondmates.md)).
+Move a REMOTE one with `bin/fm-remote-secondmate-relaunch.sh <id> <harness> <model|default|-> <effort|default|->`, which runs that same control-plane relaunch on its host and then republishes this primary's own route metadata from the identity the host confirmed; pass the profile explicitly and use `default` for an absent pin, because `config/secondmate-harness` is not inherited and the copy on that host belongs to a different home ([`docs/remote-secondmates.md`](../../../docs/remote-secondmates.md)).
+Never call `fm-remote-secondmate-control.sh relaunch` through `fm-on.sh` directly for this: it leaves this primary's own record naming the runtime the mate used to run.
 A successful update restarts every live mate of both placements on its own, including one already on the target commit; the `/updatefirstmate` skill owns that pass, and `bin/fm-secondmate-restart.sh` owns its persist gate and failure vocabulary.
 
 Do not reconstruct a secondmate's whole tree from the main home.
@@ -243,9 +248,10 @@ Run `bin/fm-teardown.sh <id>` for `kind=secondmate` only when the captain or mai
 
 The safety check is the secondmate's own home.
 Teardown refuses while its `state/*.meta` contains in-flight work.
-A remote route delegates the same guard to its configured host and additionally refuses while the primary has a pending handoff outbox or unresolved routed reply.
+Non-forced retirement also refuses while any parent pending-reply for that id is still unresolved.
+A remote route delegates the in-flight guard to its configured host and additionally refuses while the primary has a pending handoff outbox.
 SSH exit 255 preserves the route and local records because remote completion is unknown.
-When safe, teardown kills the direct endpoint, removes the `data/secondmates.md` route, clears the main home metadata, and removes the retired secondmate home.
+When retirement proceeds, teardown kills the direct endpoint, removes every parent pending-reply record for that id including resolved leftovers and its delivery confirmation, removes the `data/secondmates.md` route, clears the main home metadata, and removes the retired secondmate home.
 An endpoint close that could not be made stops the retirement before any record naming that endpoint is removed, so a cleanup never reports success for an agent that may still be live with nothing left on disk naming it.
 `--force` overrides that stop only for the retiring secondmate's own endpoint, never for a child endpoint inside forced cleanup, and a forced continue still names the endpoint you must then reconcile yourself; [`docs/verification/runtime-backends.md`](../../../docs/verification/runtime-backends.md) "Endpoint close" owns what each backend can prove about its own close.
 Removing a leased home releases its durable treehouse lease via `treehouse return`, so the pool slot is freed for reuse rather than left leased forever.

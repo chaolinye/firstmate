@@ -278,7 +278,7 @@ test_supported_backend_endpoint_records_validate() {
   id=orca-task
   fm_write_meta "$dir/home/state/$id.meta" \
     "window=fm-$id" "endpoint_task_id=$id" "terminal=term-7" \
-    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" "orca_worktree_id=worktree-9"
+    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" "orca_worktree_id=worktree-9::/orca/worktree-9"
   fm_backend_validate_task_endpoint "$dir/home/state/$id.meta" "$id" || fail "valid Orca endpoint refused"
   [ "$FM_BACKEND_VALIDATED_TARGET" = term-7 ] || fail "Orca validation did not select its terminal"
 
@@ -296,6 +296,34 @@ test_supported_backend_endpoint_records_validate() {
     [ "$target" -ne 0 ] || fail "$backend generic kill accepted an empty target"
   done
   pass "cleanup identity: valid tmux, Herdr, Zellij, Orca, and cmux records validate while every empty backend target refuses"
+}
+
+test_orca_composite_worktree_id_validates() {
+  local dir id real
+  dir=$(make_case orca-composite-worktree-id)
+  # shellcheck source=/dev/null
+  . "$ROOT/bin/fm-backend.sh"
+
+  real="411226f7-dc91-4d37-975d-32d412bf97a2::/Users/fleet/orca/workspaces/proj/fm-task"
+  fm_backend_orca_worktree_id_valid "$real" \
+    || fail "the composite worktree id Orca really returns was rejected"
+  if fm_backend_orca_worktree_id_valid "$(printf 'wt-a::/orca/wt\na')"; then
+    fail "a worktree id carrying a newline was accepted"
+  fi
+  if fm_backend_orca_worktree_id_valid "wt-atom"; then
+    fail "a worktree id with no :: separator was accepted"
+  fi
+
+  id=orca-composite-task
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=fm-$id" "endpoint_task_id=$id" "terminal=term-11" \
+    "worktree=$dir/worktree" "project=$dir/project" "backend=orca" \
+    "orca_worktree_id=411226f7-dc91-4d37-975d-32d412bf97a2::$dir/worktree"
+  fm_backend_validate_task_endpoint "$dir/home/state/$id.meta" "$id" \
+    || fail "an Orca record carrying its real composite worktree id was refused"
+  [ "$FM_BACKEND_VALIDATED_TARGET" = term-11 ] \
+    || fail "Orca validation did not select its terminal"
+  pass "cleanup identity: an Orca record's real composite worktree id validates while a separatorless or newline-carrying id refuses"
 }
 
 test_tmux_empty_target_refuses_without_invocation() {
@@ -501,6 +529,23 @@ test_reused_pool_slot_refuses_before_touching_the_other_task() {
   assert_present "$dir/home/state/$other.meta" "teardown removed the secondmate record"
   [ ! -s "$dir/runtime.log" ] \
     || fail "teardown reached the runtime on a slot held by a secondmate home: $(cat "$dir/runtime.log")"
+
+  # A second task record that is a hardlink of this one is still a second
+  # claim on the slot, not this record reached through another spelling.
+  dir=$(make_case slot-reuse-hardlink)
+  mark_case_as_treehouse_pool "$dir"
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=firstmate:fm-$id" "endpoint_task_id=$id" \
+    "worktree=$dir/worktree" "project=$dir/project" "kind=scout"
+  ln "$dir/home/state/$id.meta" "$dir/home/state/$other.meta"
+  set +e
+  run_case "$dir" "$id" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "teardown returned a pool slot a hardlinked second task record still holds"
+  assert_present "$dir/worktree/sentinel" "teardown reset a pool slot a hardlinked second task record still holds"
+  assert_contains "$(cat "$dir/stderr")" "$other" \
+    "hardlink refusal should name the other task record"
 
   pass "fm-teardown: a pool slot named by a second task record is never returned, killed, or reset"
 }
@@ -938,6 +983,43 @@ test_reassigned_pool_slot_finishes_own_cleanup_without_touching_the_slot() {
   pass "fm-teardown: a pool slot claimed by another task is left alone while the task's own cleanup finishes"
 }
 
+# The reuse collision where BOTH records survive: the stale task's record still
+# names the slot the pool handed on, and the claimant's own record names it too.
+# The claim proves the stale record's teardown is records-only, so the record
+# scan must not refuse it; once it is gone, the claimant tears down normally.
+test_stale_record_on_claimed_slot_retires_then_claimant_tears_down() {
+  local dir id=stale-task other=live-task rc
+
+  dir=$(make_case slot-reassigned-both-records)
+  mark_case_as_treehouse_pool "$dir"
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=firstmate:fm-$id" "endpoint_task_id=$id" \
+    "worktree=$dir/worktree" "project=$dir/project" "kind=scout"
+  fm_write_meta "$dir/home/state/$other.meta" \
+    "window=firstmate:fm-$other" "endpoint_task_id=$other" \
+    "worktree=$dir/worktree" "project=$dir/project" "kind=scout"
+  claim_pool_slot "$dir" "$other"
+
+  set +e
+  run_case "$dir" "$id" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "records-only teardown of a stale record on a claimed slot failed: $(cat "$dir/stderr")"
+  assert_reassigned_slot_left_alone "$dir" "$id" "$other" "stale record beside the claimant's record"
+  assert_present "$dir/worktree/sentinel" "records-only teardown reset the claimant's slot"
+  assert_present "$dir/home/state/$other.meta" "records-only teardown removed the claimant's record"
+
+  : > "$dir/runtime.log"
+  run_case "$dir" "$other" > "$dir/stdout" 2> "$dir/stderr" \
+    || fail "claimant teardown failed after the stale record retired: $(cat "$dir/stderr")"
+  assert_absent "$dir/home/state/$other.meta" "claimant teardown left its record"
+  assert_absent "$dir/pool/1/.fm-slot-owner" "claimant teardown left its spent slot claim behind"
+  grep -Fq "treehouse <return>" "$dir/runtime.log" \
+    || fail "claimant teardown did not return its pool slot: $(cat "$dir/runtime.log")"
+
+  pass "fm-teardown: a stale record on a claimed slot retires, then the claimant tears down"
+}
+
 # The two states that must never become a false refusal: the task's own claim,
 # and no claim at all (a slot taken before claims existed, or already returned).
 test_own_and_absent_slot_claims_still_tear_down() {
@@ -1258,7 +1340,7 @@ test_orca_close_failure_refuses_even_under_force() {
   fm_write_meta "$dir/home/state/$id.meta" \
     "window=fm-$id" "endpoint_task_id=$id" "terminal=term-7" \
     "worktree=$dir/nonexistent-worktree" "project=$dir/nonexistent-project" \
-    "backend=orca" "orca_worktree_id=worktree-9" "kind=ship" "mode=no-mistakes"
+    "backend=orca" "orca_worktree_id=worktree-9::/orca/worktree-9" "kind=ship" "mode=no-mistakes"
 
   set +e
   env -u TMUX -u TMUX_PANE \
@@ -1343,6 +1425,7 @@ test_control_lock_contention_refuses_before_mutation
 test_non_pool_teardown_ignores_task_set_lock
 test_metadata_lock_serializes_destructive_cleanup
 test_supported_backend_endpoint_records_validate
+test_orca_composite_worktree_id_validates
 test_tmux_empty_target_refuses_without_invocation
 test_recorded_process_identity_cleanup_is_exact
 test_isolated_tmux_invalid_and_valid_cleanup
@@ -1357,6 +1440,7 @@ test_reused_pool_slot_refuses_before_touching_the_other_task
 test_cross_home_pool_slot_collision_refuses
 test_sole_slot_record_still_tears_down
 test_reassigned_pool_slot_finishes_own_cleanup_without_touching_the_slot
+test_stale_record_on_claimed_slot_retires_then_claimant_tears_down
 test_own_and_absent_slot_claims_still_tear_down
 test_recorded_endpoint_that_changed_directory_still_tears_down
 test_project_lock_anchors_at_the_local_root_across_home_layouts
