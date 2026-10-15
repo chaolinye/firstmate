@@ -37,3 +37,22 @@ fm_basename_to() {  # <output-variable> <path>
   while [ "${fm_path%$'\n'}" != "$fm_path" ]; do fm_path=${fm_path%$'\n'}; done
   printf -v "$1" '%s' "$fm_path"
 }
+
+# fm_path_canonical_to <output-variable> <path>: fold path FORM differences for
+# same-home comparisons. On Windows hosts a path can be recorded as the MSYS
+# form (/d/Code/...), the Windows drive form (D:/Code/...), or with backslash
+# separators (D:\Code\...), and two writers of the same home can disagree on
+# the form (the Pi watcher extension injects a Windows-form FM_HOME while the
+# turn-end guard derives the MSYS form). The comparison is always between two
+# renderings of the SAME physical home, so canonicalizing separators, the drive
+# prefix, and case folds the representations onto one another without changing
+# what the comparison means on case-sensitive Linux paths.
+fm_path_canonical_to() {  # <output-variable> <path>
+  local fm_path=$2
+  fm_path=${fm_path//\\//}
+  case "$fm_path" in
+    [A-Za-z]:/*) fm_path="/${fm_path%%:*}${fm_path#*:}" ;;
+  esac
+  printf -v "$1" '%s' "${fm_path,,}"
+}
+

@@ -168,13 +168,19 @@ fm_watcher_lock_unheld() {
 
 FM_WATCHER_MATCHED_IDENTITY=
 fm_watcher_lock_matches_pid() {
-  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
+  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity lock_home_canon home_canon
   FM_WATCHER_MATCHED_IDENTITY=
   lockdir="$state/.watch.lock"
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
-  [ "$lock_home" = "$home" ] || return 1
+  # fm-home is written by the watcher from its own $FM_HOME, which on Windows can
+  # be the drive form (D:\Code\...) injected by the Pi arm, while the guard
+  # derives the MSYS form (/d/Code/...); canonicalizing both sides keeps the
+  # same-home verdict from depending on path representation.
+  fm_path_canonical_to lock_home_canon "$lock_home"
+  fm_path_canonical_to home_canon "$home"
+  [ "$lock_home_canon" = "$home_canon" ] || return 1
   [ "$lock_path" = "$watch_path" ] || return 1
   [ -n "$lock_identity" ] || return 1
   current_identity=$(fm_pid_identity "$pid") || return 1
