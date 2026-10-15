@@ -3075,18 +3075,24 @@ fm_backend_herdr_target_ready() {  # <target>
 # any error. Mirrors tmux's pane_current_path poll used for worktree-path
 # discovery after `treehouse get`.
 #
-# Verified pitfall: `pane get`'s `.result.pane.cwd` is the pane's cwd AT
-# CREATION TIME - the top-level shell's cwd - and does NOT update when that
-# shell `cd`s or enters a subshell (as `treehouse get` does). Reading it here
-# would make fm-spawn.sh's worktree-discovery poll never see the pane "leave"
-# the project directory, since `cwd` stays frozen at the original path forever.
+# Verified pitfall: on the adapter's verified herdr range (0.7.1-0.8.0),
+# `pane get`'s `.result.pane.cwd` is the pane's cwd AT CREATION TIME - the
+# top-level shell's cwd - and does NOT update when that shell `cd`s or enters a
+# subshell (as `treehouse get` does). Reading it there would make fm-spawn.sh's
+# worktree-discovery poll never see the pane "leave" the project directory,
+# since `cwd` stays frozen at the original path forever.
 # `.result.pane.foreground_cwd` tracks the ACTUALLY RUNNING foreground
 # process's cwd instead, which is what changes when `treehouse get` enters its
 # worktree subshell - confirmed live against a real treehouse acquisition.
+# herdr 0.9.0 inverts that: `pane get` reports `foreground_cwd: null` while
+# `cwd` now tracks the live foreground path, so fall back to `cwd` when the
+# preferred field is absent. On the old range the frozen `cwd` is the project
+# directory and still fails worktree-isolation screening (the poll keeps
+# waiting, exactly as before), so the fallback is strictly improving.
 fm_backend_herdr_current_path() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
-    | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+    | jq -r '.result.pane.foreground_cwd // .result.pane.cwd // empty' 2>/dev/null
 }
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,
