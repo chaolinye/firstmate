@@ -166,7 +166,12 @@ write_executable() {
 # is the other environment channel that can carry this directory as
 # core.hooksPath; only the repository's config files name its own hooks. Skip
 # when the lookup still names this launch's own hooks dir, meaning those files
-# point here, so the wrapper cannot recurse into itself. An empty
+# point here, so the wrapper cannot recurse into itself. On Windows the
+# install-resolved hooks dir (pwd -P, MSYS form /d/Code/...) and git's
+# --path-format=absolute output (drive form D:/Code/...) render one path two
+# ways, so both sides are folded through an inline canonicalization before the
+# self-recognition comparison, exactly like fm_path_canonical_to in
+# bin/fm-path-lib.sh (this generated hook cannot source the library). An empty
 # core.hooksPath makes that lookup fail, but plain git reads it as "no hooks",
 # so the wrapper runs none; any other failure reruns the lookup to show git's
 # error and refuses.
@@ -198,7 +203,15 @@ orig=\$(unset GIT_CONFIG_PARAMETERS; git rev-parse --path-format=absolute --git-
   echo "fm-git-strip-ai-trailers: cannot resolve this repository's hooks directory; refusing to skip its \$name hook" >&2
   exit 1
 }
-if [ "\$orig" = "\$ours" ]; then
+canon() {
+  local p=\$1
+  p=\${p//\\\\//}
+  case "\$p" in
+    [A-Za-z]:/*) p="/\${p%%:*}\${p#*:}" ;;
+  esac
+  printf '%s' "\${p,,}"
+}
+if [ "\$(canon "\$orig")" = "\$(canon "\$ours")" ]; then
   exit 0
 fi
 if [ -x "\$orig/\$name" ]; then
