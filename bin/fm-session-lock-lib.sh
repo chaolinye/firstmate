@@ -55,6 +55,41 @@ fm_harness_path_name() {  # <path>
   return 1
 }
 
+# Portable single-pid process introspection.
+#
+# procps/BSD `ps -o comm=/args=/ppid=` custom-format columns are the primary
+# path and cover Linux and macOS. Cygwin's ps, which Git for Windows ships, has
+# no -o option at all and exits with "unknown option -- o", so the primary path
+# fails outright there and the ancestry walk aborts on its first hop. The
+# fallbacks parse Cygwin's fixed columns instead:
+#   ps -p PID     PID PPID PGID WINPID TTY UID STIME COMMAND   (executable path)
+#   ps -f -p PID  UID PID PPID TTY STIME COMMAND               (full argv)
+# A genuinely dead or inaccessible pid still fails both paths, so this widens
+# nothing: it only stops a supported platform from failing on ps syntax alone.
+fm_ps_comm() {  # <pid> -> executable name or path
+  local pid=$1 out
+  out=$(ps -o comm= -p "$pid" 2>/dev/null) && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  out=$(ps -p "$pid" 2>/dev/null | awk 'NR == 2 { for (i = 8; i <= NF; i++) printf "%s%s", (i > 8 ? " " : ""), $i; exit }')
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+fm_ps_args() {  # <pid> -> full command line
+  local pid=$1 out
+  out=$(ps -o args= -p "$pid" 2>/dev/null) && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  out=$(ps -f -p "$pid" 2>/dev/null | awk 'NR == 2 { for (i = 6; i <= NF; i++) printf "%s%s", (i > 6 ? " " : ""), $i; exit }')
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+fm_ps_ppid() {  # <pid> -> parent pid
+  local pid=$1 out
+  out=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  out=$(ps -f -p "$pid" 2>/dev/null | awk 'NR == 2 { print $3; exit }')
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
 # True when the process described by command name $1 and full argument string $2
 # is a verified harness. Sets FM_HARNESS_IS_CLAUDE for the ancestry walk.
 #
@@ -88,6 +123,16 @@ fm_harness_process_matches() {  # <comm> <args>
         case "$args" in *claude*) FM_HARNESS_IS_CLAUDE=1 ;; esac
         return 0
       fi
+      # The Pi CLI runs as a bare node interpreter whose harness identity lives
+      # only in its script path (@earendil-works/pi-coding-agent). Neither the
+      # process name (node) nor a path component matches the exact-name tables
+      # above, so this package marker is the one recognition a Pi session's
+      # lock identity uses. Narrow to the package path so an unrelated node
+      # script that merely mentions pi in its own name cannot claim a Pi
+      # identity.
+      if printf '%s' "$args" | grep -qE "$FM_PI_MARKER_RE"; then
+        return 0
+      fi
       ;;
   esac
   # Cursor: its own owner decides, from Cursor's name or versioned install tree
@@ -95,6 +140,191 @@ fm_harness_process_matches() {  # <comm> <args>
   # locate its own harness in the ancestry, so every session start refuses the
   # fleet lock as read-only and the park can never arm.
   fm_cursor_process_matches "$comm" "$args" "$argv0" && return 0
+  return 1
+}
+
+# --- Windows process-boundary bridge -----------------------------------------
+#
+# On Cygwin (Git for Windows) the harness is a native Windows process, and the
+# parent link from a shell it spawns does NOT cross the Cygwin boundary: Cygwin
+# reports that shell's PPID as 1. So no amount of walking ppid can ever reach the
+# harness, and the contiguous-run model below cannot be satisfied by the Cygwin
+# process table alone. The Windows process table does hold the real parent chain,
+# and `ps -W` lists Windows processes keyed by WINPID, so identity is recovered
+# from there instead.
+#
+# Windows pids live in a DIFFERENT namespace from Cygwin pids: `kill -0` on a
+# Windows pid reports "No such process" even while that process is running, and a
+# Windows pid can collide with an unrelated live Cygwin pid. A bare number is
+# therefore ambiguous and unsafe to store. Every pid resolved through this bridge
+# is tagged, which makes the namespace explicit for readers and makes the value
+# non-numeric so that any consumer treating it as a Cygwin pid - including a
+# future `kill` - refuses it instead of acting on the wrong process.
+FM_WIN_PID_PREFIX='win:'
+
+# True on a Cygwin-family userspace, where the boundary above applies.
+fm_win_boundary_applies() {
+  case "$(uname -s 2>/dev/null)" in
+    CYGWIN*|MINGW*|MSYS*) return 0 ;;
+  esac
+  return 1
+}
+
+# Strip the namespace tag from $1, or return 1 when $1 is not a tagged pid.
+# The tag is only meaningful where the boundary applies; anywhere else it is
+# rejected exactly like any other non-numeric lock value.
+fm_win_untag_pid() {  # <pid>
+  local winpid
+  case "$1" in
+    "$FM_WIN_PID_PREFIX"*) winpid=${1#"$FM_WIN_PID_PREFIX"} ;;
+    *) return 1 ;;
+  esac
+  case "$winpid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  fm_win_boundary_applies || return 1
+  printf '%s' "$winpid"
+}
+
+# True when $1 is a well-formed session-lock identity: a local pid, or a tagged
+# Windows pid. Every reader of state/.lock decides "is this value usable at all"
+# through this one predicate, because the readers are spread across several
+# scripts and a private numeric test in any one of them silently rejects a valid
+# holder - which reads as "startup never completed" and repeats the whole
+# sequence on every clear or compact.
+fm_session_pid_valid() {  # <value>
+  fm_win_untag_pid "$1" >/dev/null && return 0
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Windows command paths are backslash-separated and .exe-suffixed, neither of
+# which the path-component matcher above understands. Normalizing here is what
+# keeps that matcher's whole-component safety intact: without it the harness
+# regex would fall back to matching the entire unsplit path, so an unrelated
+# C:\claude-notes\tool.exe would read as a harness process.
+fm_win_normalize_command() {  # <windows path>
+  local path=${1//\\//}
+  printf '%s' "${path%.exe}"
+}
+
+# Print the full command line of live Windows process $1, or return 1. The
+# executable path alone cannot name a node-bundle harness such as Pi, whose
+# identity lives in its script path, so liveness checks that need the full
+# command line use this instead of fm_win_command.
+# shellcheck disable=SC2317 # Not all consumers exist in every sourced context.
+fm_win_command_line() {  # <winpid>
+  local winpid=$1 cmd
+  case "$winpid" in
+    ''|*[!0-9]*) return 2 ;;
+  esac
+  cmd=$(powershell -NoProfile -NonInteractive -Command \
+    "(Get-CimInstance Win32_Process -Filter 'ProcessId=$winpid').CommandLine" 2>/dev/null) || return 2
+  cmd=${cmd%$'\r'}
+  [ -n "$cmd" ] || return 1
+  printf '%s' "$cmd"
+}
+
+# Print the normalized executable path of live Windows process $1, or return 1.
+# Presence in `ps -W` is also this bridge's liveness test, because kill -0 cannot
+# answer that question across the namespace boundary.
+fm_win_command() {  # <winpid>
+  local winpid=$1 table out
+  case "$winpid" in
+    ''|*[!0-9]*) return 2 ;;
+  esac
+  # Return 1 only when a readable table proves the pid absent, and 2 when the
+  # table itself could not be read, so a caller can tell gone from unknown.
+  table=$(ps -W 2>/dev/null) || return 2
+  case "$table" in
+    *WINPID*) ;;
+    *) return 2 ;;
+  esac
+  out=$(printf '%s\n' "$table" | awk -v w="$winpid" '$4 == w { for (i = 8; i <= NF; i++) printf "%s%s", (i > 8 ? " " : ""), $i; exit }')
+  [ -n "$out" ] || return 1
+  fm_win_normalize_command "$out"
+}
+
+# Environment variables through which a verified harness publishes the pid of
+# its own session process. Extend only with a variable confirmed to name the
+# session-long harness process on Windows, because the identity check below is
+# only as narrow as this table.
+#
+# Walking the real Windows parent chain is deliberately NOT the fallback here.
+# Two properties of this platform make it unusable for identity:
+#   - MSYS emulates exec by spawning a fresh Windows process and exiting the old
+#     one, so intermediate shells vanish constantly and a child's recorded parent
+#     is routinely a pid that no longer exists. The chain simply breaks.
+#   - Windows never reparents an orphan, so that dangling parent id stays on the
+#     child and Windows is free to reissue it. Following it can therefore land on
+#     an unrelated live process and bind a home's session lock to it, which is
+#     the wrong-process-binding failure this file exists to prevent.
+# A harness that publishes nothing is reported as unresolved instead, which
+# leaves the session read-only exactly as before - the safe direction.
+FM_WIN_HARNESS_PID_VARS=(CLAUDE_PID)
+
+# The Pi CLI ships as a node bundle under the pi-coding-agent package; its
+# Windows process name is node.exe, so neither the process name nor a path
+# component can name it. The package marker below is that identity, and the
+# session id the Pi process publishes (PI_SESSION_ID) locates the live process.
+FM_PI_MARKER_RE='@earendil-works/pi-coding-agent|pi-coding-agent/(dist|bundle)'
+
+# Print the tagged Windows pid of this session's live Pi harness process, or
+# return 1. Pi publishes no session pid variable, only PI_SESSION_ID (the
+# conversation id passed as --session on its own command line). The command
+# line is scanned for that exact id AND the pi-coding-agent marker, so an
+# unrelated process carrying the id cannot be mistaken for the harness, and a
+# recycled pid is rejected because the marker must accompany it. The found pid
+# is then confirmed live in the Windows table and matched as a harness before
+# it is printed.
+fm_win_pi_harness_pid() {  # -> tagged win:<pid>, or 1
+  local sid=${PI_SESSION_ID:-} pids pid line
+  [ -n "$sid" ] || return 1
+  # Session ids are conversational UUIDs; refuse anything that could break out
+  # of the PowerShell filter below.
+  case "$sid" in
+    *[!A-Za-z0-9-]*) return 1 ;;
+  esac
+  pids=$(powershell -NoProfile -NonInteractive -Command \
+    "Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*$sid*' -and \$_.CommandLine -like '*pi-coding-agent*' } | ForEach-Object { Write-Output \$_.ProcessId }" 2>/dev/null) || return 1
+  for pid in $pids; do
+    pid=${pid%$'\r'}  # PowerShell emits CRLF; strip the carriage return.
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    # Confirm the full command line carries both the session id and the Pi
+    # package marker; fm_win_command (exe path) cannot prove a node harness.
+    line=$(fm_win_command_line "$pid") || continue
+    fm_harness_process_matches "$(fm_win_command "$pid")" "$line" || continue
+    printf '%s%s\n' "$FM_WIN_PID_PREFIX" "$pid"
+    return 0
+  done
+  return 1
+}
+
+# Print this session's harness as one tagged Windows pid, or return 1.
+#
+# The published pid is a claim, not evidence, so it is never trusted on its own:
+# it is confirmed against the Windows process table, and accepted only when that
+# pid is still live AND its executable independently identifies a verified
+# harness by the same rules every other platform uses. A value that is absent,
+# malformed, stale, or naming a non-harness process is discarded rather than
+# used, so a wrong or recycled pid fails closed instead of binding the lock.
+fm_win_harness_ancestry_pids() {
+  local var winpid comm
+  for var in "${FM_WIN_HARNESS_PID_VARS[@]}"; do
+    winpid=${!var:-}
+    case "$winpid" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    comm=$(fm_win_command "$winpid") || continue
+    fm_harness_process_matches "$comm" "$comm" || continue
+    printf '%s%s\n' "$FM_WIN_PID_PREFIX" "$winpid"
+    return 0
+  done
+  # Pi publishes no session pid, so its harness is located by session id and
+  # package marker instead of by a published pid variable.
+  fm_win_pi_harness_pid && return 0
   return 1
 }
 
@@ -119,8 +349,8 @@ fm_harness_process_matches() {  # <comm> <args>
 fm_harness_ancestry_pids() {
   local pid=$$ comm args extending=0 printed=0
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
-    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    comm=$(fm_ps_comm "$pid") || break
+    args=$(fm_ps_args "$pid")
     if fm_harness_process_matches "$comm" "$args"; then
       printf '%s\n' "$pid"
       printed=1
@@ -129,7 +359,7 @@ fm_harness_ancestry_pids() {
     elif [ "$extending" -eq 1 ]; then
       break
     fi
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    pid=$(fm_ps_ppid "$pid")
     # Examine the top of the chain before stopping. Inside a PID namespace the
     # harness itself is pid 1, so stopping as soon as the next pid is 1 hides the
     # very process this walk exists to find. A host's real pid 1 (init, systemd,
@@ -137,6 +367,14 @@ fm_harness_ancestry_pids() {
     case "$pid" in '' | *[!0-9]*) break ;; esac
     [ "$pid" -ge 1 ] || break
   done
+  # A harness living in the same process table is always preferred, so an
+  # ordinary POSIX ancestry keeps resolving to plain pids and nothing about the
+  # existing platforms changes. The Windows bridge is consulted only after that
+  # walk finds nothing, which on Cygwin is what the severed parent link
+  # guarantees it will do.
+  if [ "$printed" -eq 0 ] && fm_win_boundary_applies; then
+    fm_win_harness_ancestry_pids && return 0
+  fi
   [ "$printed" -eq 1 ]
 }
 
@@ -164,11 +402,23 @@ EOF
 }
 
 # True if $1 is a live process that looks like a verified harness.
+# A tagged Windows pid is answered from the Windows process table, because
+# kill -0 cannot see across that boundary and would report a live harness as
+# dead - which would hand a running session's home to a second one.
 fm_harness_pid_alive() {
-  local pid=$1 comm args
+  local pid=$1 comm args winpid line
+  if winpid=$(fm_win_untag_pid "$pid"); then
+    comm=$(fm_win_command "$winpid") || return 1
+    fm_harness_process_matches "$comm" "$comm" && return 0
+    # A node-bundle harness (Pi) is not named by its executable path; its
+    # identity lives in the full command line's script path.
+    line=$(fm_win_command_line "$winpid") || return 1
+    fm_harness_process_matches "$comm" "$line"
+    return
+  fi
   kill -0 "$pid" 2>/dev/null || return 1
-  comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  comm=$(fm_ps_comm "$pid") || return 1
+  args=$(fm_ps_args "$pid")
   fm_harness_process_matches "$comm" "$args"
 }
 
@@ -276,9 +526,7 @@ fm_session_lock_anchor_pid() {
 fm_session_lock_owned_by_self() {
   local state=$1 lock_pid pids pid
   lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
-  case "$lock_pid" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
+  fm_session_pid_valid "$lock_pid" || return 1
   pids=$(fm_harness_ancestry_pids) || return 1
   while IFS= read -r pid; do
     [ "$pid" = "$lock_pid" ] && return 0
@@ -301,9 +549,7 @@ fm_session_lock_foreign_owner_live() {
   FM_SESSION_LOCK_FOREIGN_OWNER_PID=
   [ -f "$state/.lock" ] && [ ! -L "$state/.lock" ] || return 1
   lock_pid=$(cat "$state/.lock" 2>/dev/null || true)
-  case "$lock_pid" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
+  fm_session_pid_valid "$lock_pid" || return 1
   fm_harness_pid_alive "$lock_pid" || return 1
   pids=$(fm_harness_ancestry_pids) || return 1
   while IFS= read -r pid; do
@@ -336,7 +582,7 @@ FM_LOCK_INSPECT_STATE=unknown
 FM_LOCK_INSPECT_PID=
 FM_LOCK_INSPECT_LIVE_HARNESS=unknown
 fm_session_lock_inspect() {  # <state>
-  local state=$1 lock pid
+  local state=$1 lock pid winpid win_rc
   # shellcheck disable=SC2034 # Output globals, read by lock status and inbox ready.
   FM_LOCK_INSPECT_STATE=unknown
   # shellcheck disable=SC2034 # Output globals, read by lock status and inbox ready.
@@ -360,12 +606,25 @@ fm_session_lock_inspect() {  # <state>
   pid=${pid%%$'\n'*}
   # shellcheck disable=SC2034 # Output global, read by lock status and inbox ready.
   FM_LOCK_INSPECT_PID=$pid
-  case "$pid" in
-    ''|*[!0-9]*)
-      FM_LOCK_INSPECT_STATE=unknown
+  fm_session_pid_valid "$pid" || return 0
+  if winpid=$(fm_win_untag_pid "$pid"); then
+    # The same verdicts as a local pid below, read from the Windows table.
+    if fm_harness_pid_alive "$pid"; then
+      FM_LOCK_INSPECT_STATE=held
+      FM_LOCK_INSPECT_LIVE_HARNESS=true
       return 0
-      ;;
-  esac
+    fi
+    win_rc=0
+    fm_win_command "$winpid" >/dev/null || win_rc=$?
+    case "$win_rc" in
+      0) FM_LOCK_INSPECT_LIVE_HARNESS=false ;;
+      1)
+        FM_LOCK_INSPECT_STATE=stale
+        FM_LOCK_INSPECT_LIVE_HARNESS=false
+        ;;
+    esac
+    return 0
+  fi
   if kill -0 "$pid" 2>/dev/null; then
     if fm_harness_pid_alive "$pid"; then
       FM_LOCK_INSPECT_STATE=held
