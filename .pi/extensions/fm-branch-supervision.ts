@@ -383,6 +383,18 @@ function readLockPid(): { lockPid: string; verdict: LockOwnership | null } {
   } catch {
     return { lockPid: "", verdict: "missing" };
   }
+  // A Windows-tagged identity (win:<pid>) names the session process in the
+  // Windows pid namespace. The extension runs inside the Pi process, so its
+  // own process.pid is that same Windows pid on Windows: strip the tag before
+  // the ancestry comparison. A malformed or non-numeric tag is inert exactly
+  // like any other non-numeric lock value.
+  if (lockPid.startsWith("win:")) {
+    const winpid = lockPid.slice(4);
+    if (!/^[0-9]+$/.test(winpid) || winpid === "1") {
+      return { lockPid, verdict: "other" };
+    }
+    lockPid = winpid;
+  }
   if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return { lockPid, verdict: "other" };
   return { lockPid, verdict: null };
 }

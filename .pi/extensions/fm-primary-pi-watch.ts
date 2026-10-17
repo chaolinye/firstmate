@@ -264,6 +264,19 @@ function lockOwnership(): LockOwnership {
   } catch {
     return "missing";
   }
+  // A Windows-tagged identity (win:<pid>) names the session process in the
+  // Windows pid namespace. The extension runs inside the Pi process, so its
+  // own process.pid is that same Windows pid on Windows: strip the tag and
+  // compare directly. A live foreign win: holder reads as "other" and a dead
+  // one as "missing" (reclaimable), matching the untagged contract.
+  if (lockPid.startsWith("win:")) {
+    const winpid = lockPid.slice(4);
+    if (/^[0-9]+$/.test(winpid) && winpid !== "1") {
+      if (winpid === String(process.pid)) return "owned";
+      return pidAlive(winpid) ? "other" : "missing";
+    }
+    return "other";
+  }
   if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return "other";
   let pid = String(process.pid);
   for (let i = 0; i < 8; i += 1) {
