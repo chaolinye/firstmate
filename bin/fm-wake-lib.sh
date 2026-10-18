@@ -65,6 +65,25 @@ fm_pid_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
+# fm_session_pid_alive <value>: liveness for a session-lock identity. A plain
+# local pid is answered with kill -0; a Windows-tagged pid (win:<pid>) cannot be
+# seen by Cygwin's kill across the namespace boundary, so it is answered from the
+# Windows process table (ps -W) instead. A malformed or absent value is dead.
+fm_session_pid_alive() {
+  local pid=$1 winpid
+  case "$pid" in
+    win:*)
+      winpid=${pid#win:}
+      case "$winpid" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      ps -W 2>/dev/null | awk -v w="$winpid" '$4 == w { found = 1; exit } END { exit !found }'
+      return
+      ;;
+  esac
+  fm_pid_alive "$pid"
+}
+
 fm_pid_identity() {
   local pid=$1 out proc_root stat_line starttime cmdline_hex identity_key
   local -a stat_fields
@@ -288,6 +307,15 @@ fm_pi_extension_loaded() {
   marker_pid=$(sed -n '2p' "$marker")
   lock_pid=$(sed -n '1p' "$lock")
   [ -n "$marker_pid" ] || return 1
+  # The extension records its plain Windows pid; the session lock may carry the
+  # same pid Windows-tagged (win:<pid>) for the Cygwin namespace. Strip the tag
+  # so the two compare equal.
+  case "$lock_pid" in
+    win:*)
+      lock_pid=${lock_pid#win:}
+      case "$lock_pid" in ''|*[!0-9]*) return 1 ;; esac
+      ;;
+  esac
   [ "$marker_version" = "$expected_version" ] && [ "$marker_pid" = "$lock_pid" ] || return 1
   [ -z "$required_phase" ] && return 0
   owner=$(sed -n '3p' "$marker")
@@ -349,7 +377,7 @@ fm_extension_pair_owns_supervision() {  # <state> <extension-dir> <source:marker
     fm_pi_extension_loaded "$state/$marker" "$version" "$lock" "$phase" || return 1
   done
   session_pid=$(sed -n '1p' "$lock" 2>/dev/null)
-  fm_pid_alive "$session_pid"
+  fm_session_pid_alive "$session_pid"
 }
 
 # Away-mode supervision evidence. While state/.afk exists the away-mode daemon
