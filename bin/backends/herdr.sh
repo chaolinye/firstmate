@@ -3097,8 +3097,11 @@ fm_backend_herdr_target_ready() {  # <target>
 # worktree subshell - confirmed live against a real treehouse acquisition.
 fm_backend_herdr_current_path() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
+  # Older herdr exposes the pane cwd directly as `cwd`; newer builds add
+  # `foreground_cwd` (which can be null). Prefer foreground_cwd when present,
+  # fall back to cwd so a fresh pane still reports its worktree path.
   fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
-    | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+    | jq -r '.result.pane.foreground_cwd // .result.pane.cwd // empty' 2>/dev/null
 }
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,
