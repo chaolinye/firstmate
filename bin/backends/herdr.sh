@@ -845,8 +845,20 @@ fm_backend_herdr_presentation_lock_namespace_valid() {
 fm_backend_herdr_canonical_socket_path() {  # <socket-path>
   local socket=$1 sock_dir sock_base
   [ -n "$socket" ] || return 1
+  # A Windows-form path (C:\...) arrives from the herdr env injection and from
+  # herdr's own session JSON on MSYS/Git-Bash hosts; normalize it to the Unix
+  # form the adapter compares, when cygpath is available. A Unix-form path is
+  # used as-is. On a platform without cygpath (Linux/macOS) a Windows-form path
+  # is refused exactly as before.
   case "$socket" in
     /*) ;;
+    [A-Za-z]:[\\/]*)
+      if command -v cygpath >/dev/null 2>&1; then
+        socket=$(cygpath -u "$socket" 2>/dev/null) || return 1
+      else
+        return 1
+      fi
+      ;;
     *) return 1 ;;
   esac
   sock_dir=$(dirname "$socket")
