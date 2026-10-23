@@ -1568,6 +1568,36 @@ test_msys_pid_identity_uses_proc() {
   pass "MSYS process identity uses compatible /proc fields"
 }
 
+test_watcher_healthy_matches_windows_form_fm_home() {
+  # The Pi arm injects FM_HOME in the Windows drive form (D:\Code\...) while
+  # the turn-end guard derives the MSYS form (/d/Code/...); the fm-home lock
+  # comparison must fold the path representation or a live, fresh watcher is
+  # misread as down on Windows hosts (the repeated "SUPERVISION IS OFF"
+  # false positive). Build a synthetic lock in the drive form and assert the
+  # strict health check accepts it against the MSYS-form home.
+  local dir state lockdir
+  dir=$(make_case windows-fm-home)
+  state="$dir/state"
+  lockdir="$state/.watch.lock"
+  mkdir -p "$lockdir"
+  printf '%s\n' 'D:\Code\opensource\firstmate' > "$lockdir/fm-home"
+  printf '%s\n' "$WATCH" > "$lockdir/watcher-path"
+  printf '%s\n' "$$" > "$lockdir/pid"
+  printf '%s\n' "$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$$")" > "$lockdir/pid-identity"
+  touch "$state/.last-watcher-beat"
+  bash -c '. "$1"; fm_watcher_healthy "$2" "$3" 300 /d/Code/opensource/firstmate' \
+    _ "$LIB" "$state" "$WATCH" \
+    || fail "live fresh watcher with a Windows-form fm-home was misread as unhealthy"
+  # A genuinely different home must still be rejected after canonicalization.
+  printf '%s\n' 'D:\Code\opensource\other' > "$lockdir/fm-home"
+  touch "$state/.last-watcher-beat"
+  if bash -c '. "$1"; fm_watcher_healthy "$2" "$3" 300 /d/Code/opensource/firstmate' \
+    _ "$LIB" "$state" "$WATCH"; then
+    fail "different-home fm-home was accepted after canonicalization"
+  fi
+  pass "fm_watcher_healthy folds the Windows/MSYS fm-home path form and still rejects a different home"
+}
+
 test_windows_symlink_capability_failure_is_bounded() {
   local dir rc
   dir=$(make_case windows-no-symlinks)
@@ -1631,6 +1661,7 @@ test_pid_identity_is_locale_invariant
 test_pid_identity_is_terminal_width_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_msys_pid_identity_uses_proc
+test_watcher_healthy_matches_windows_form_fm_home
 test_stale_watch_lock_reclaimed
 test_stale_watch_reclaim_publishes_before_clear
 test_live_stale_watch_lock_is_actionable
