@@ -479,7 +479,7 @@ fm_procevent_extension_registration_load_locked() {  # <state> <source-id>
   [ -f "$file" ] && [ ! -L "$file" ] || return 2
   owner_line=$(sed -n '2p' "$file") || return 2
   [ "$owner_line" = owner=extension ] || return 1
-  [ "$(fm_pr_file_mode "$file")" = 600 ] \
+  fm_pr_mode_matches "$file" 600 \
     && [ "$(fm_pr_file_link_count "$file")" = 1 ] || return 2
   {
     IFS= read -r adapter_line \
@@ -592,7 +592,9 @@ fm_procevent_claim_load_locked() {  # <source-id>
     case "$state_inode" in ''|*[!0-9]*) return 1 ;; esac
     case "$state_owner" in ''|*[!0-9]*) return 1 ;; esac
     case "$state_mode" in ''|*[!0-7]*) return 1 ;; esac
-    [ $((8#$state_mode & 8#022)) -eq 0 ] || return 1
+    if fm_pr_mode_enforced; then
+      [ $((8#$state_mode & 8#022)) -eq 0 ] || return 1
+    fi
   elif [ -n "$state_device$state_inode$state_owner$state_mode" ]; then
     return 1
   fi
@@ -1029,10 +1031,12 @@ fm_procevent_private_directory_valid() {
   fm_procevent_directory_owned_by_current_user "$directory" || return 1
   mode=$(fm_pr_file_mode "$directory") || return 1
   case "$mode" in ''|*[!0-7]*) return 1 ;; esac
-  if [ "$exact_mode" = 1 ]; then
-    [ "$mode" = 700 ] || return 1
-  elif [ $((8#$mode & 8#022)) -ne 0 ]; then
-    return 1
+  if fm_pr_mode_enforced; then
+    if [ "$exact_mode" = 1 ]; then
+      [ "$mode" = 700 ] || return 1
+    elif [ $((8#$mode & 8#022)) -ne 0 ]; then
+      return 1
+    fi
   fi
   canonical=$(cd -P -- "$directory" && pwd -P) || return 1
   normalized=$(fm_procevent_path_normalize "$directory") || return 1
@@ -1335,7 +1339,7 @@ fm_procevent_result_extension_load() {  # <result-path>
   local package_line binding_line extra
   [ -e "$file" ] || return 1
   [ -f "$file" ] && [ ! -L "$file" ] || return 2
-  [ "$(fm_pr_file_mode "$file")" = 600 ] \
+  fm_pr_mode_matches "$file" 600 \
     && [ "$(fm_pr_file_link_count "$file")" = 1 ] || return 2
   {
     IFS= read -r schema_line \

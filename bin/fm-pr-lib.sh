@@ -365,15 +365,55 @@ fm_pr_sha256() {
   fi
 }
 
+# fm_pr_mode_enforced: whether this platform can express POSIX file modes.
+# On Windows/MSYS/Cygwin chmod is a no-op -- a file created under umask 077 and
+# then chmod 600 still reports 644 -- so a mode comparison carries no security
+# signal there, and every registered check, trust record, receipt, and private
+# directory that requires one would refuse to work on those hosts.
+# The captain's standing decision is to relax mode enforcement across the whole
+# Windows platform. What still guards the trust boundary there is structural:
+# a regular file, never a symlink, a single hard link, the containing
+# filesystem, and each caller's content hash binding.
+FM_PR_MODE_ENFORCED=${FM_PR_MODE_ENFORCED:-}
+fm_pr_mode_enforced() {
+  if [ -z "$FM_PR_MODE_ENFORCED" ]; then
+    case "${_FM_UNAME:-$(uname -s 2>/dev/null || printf '%s' unknown)}" in
+      windows|MINGW*|MSYS*|CYGWIN*) FM_PR_MODE_ENFORCED=0 ;;
+      *) FM_PR_MODE_ENFORCED=1 ;;
+    esac
+  fi
+  [ "$FM_PR_MODE_ENFORCED" -eq 1 ]
+}
+
+# fm_pr_mode_matches <path> <mode>: the mode requirement in one place, so no
+# caller restates the platform rule. Always true where modes are unenforceable,
+# otherwise an exact comparison.
+fm_pr_mode_matches() {
+  local path=$1 mode=$2
+  fm_pr_mode_enforced || return 0
+  [ "$(fm_pr_file_mode "$path")" = "$mode" ]
+}
+
+# fm_pr_mode_is_private_group_safe <mode>: the "no group or other write"
+# requirement for a private directory, relaxed the same way and in one place.
+fm_pr_mode_is_private_group_safe() {
+  local mode=$1
+  fm_pr_mode_enforced || return 0
+  case "$mode" in ''|*[!0-7]*) return 1 ;; esac
+  [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
 # Callers pass the containing directory's device read in the same invocation,
 # never a persisted one, so this compares two live readings and survives a
 # remount that renumbers the volume. It refuses a file that is not on that
 # directory's own filesystem, such as one bind-mounted over the name, which is
 # also what keeps same-directory rename publication atomic.
+# The mode requirement goes through fm_pr_mode_matches, so it applies
+# everywhere POSIX modes are enforceable and nowhere they are not.
 fm_pr_private_file_valid() {
   local path=$1 mode=$2 device=$3
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
-  [ "$(fm_pr_file_mode "$path")" = "$mode" ] || return 1
+  fm_pr_mode_matches "$path" "$mode" || return 1
   [ "$(fm_pr_file_device "$path")" = "$device" ] || return 1
   [ "$(fm_pr_file_link_count "$path")" = 1 ]
 }

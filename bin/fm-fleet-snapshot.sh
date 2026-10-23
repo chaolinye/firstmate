@@ -1334,7 +1334,12 @@ snapshot_cache_prepare() {
     [ -d "$FM_SNAPSHOT_CACHE_DIR" ] && [ ! -L "$FM_SNAPSHOT_CACHE_DIR" ] || return 1
     mode=$(file_mode_octal "$FM_SNAPSHOT_CACHE_DIR")
     case "$mode" in ''|*[!0-7]*) return 1 ;; esac
-    [ $((8#$mode & 077)) -eq 0 ] || return 1
+    # The "nobody else may reach this cache" test is a POSIX mode policy; a
+    # Windows host cannot express it, so it is skipped there (fm_pr_mode_enforced
+    # owns that platform rule) and the cache stays available as it is on POSIX.
+    if fm_pr_mode_enforced; then
+      [ $((8#$mode & 077)) -eq 0 ] || return 1
+    fi
   else
     [ -d "$(dirname "$FM_SNAPSHOT_CACHE_DIR")" ] || return 1
     (umask 077; mkdir "$FM_SNAPSHOT_CACHE_DIR") 2>/dev/null || return 1

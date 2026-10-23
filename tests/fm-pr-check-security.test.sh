@@ -3312,6 +3312,44 @@ shift_registration_device() {  # <state> <id> [both|data|check]
   esac
 }
 
+test_private_mode_requirement_follows_the_platform() {
+  # POSIX hosts enforce an exact private mode; a Windows host cannot express
+  # one (a 0600 chmod still reads 0644), so that half is skipped there while
+  # every structural check keeps biting. FM_PR_MODE_ENFORCED is the single
+  # owner of the platform verdict and is forced here so both branches are
+  # exercised on either host.
+  local dir file device mode_works=0
+  dir=$(make_case private-mode-platform)
+  file="$dir/probe"
+  printf 'x\n' > "$file"
+  chmod 0600 "$file" 2>/dev/null || true
+  [ "$(fm_pr_file_mode "$file")" = 600 ] && mode_works=1
+  device=$(fm_pr_file_device "$dir") || fail "could not read the private artifact fixture device"
+
+  if [ "$mode_works" -eq 1 ]; then
+    FM_PR_MODE_ENFORCED=1
+    fm_pr_private_file_valid "$file" 600 "$device" \
+      || fail "a private regular file was refused where modes are enforceable"
+    chmod 0644 "$file" 2>/dev/null || true
+    if fm_pr_private_file_valid "$file" 600 "$device"; then
+      fail "a 644 file satisfied a 600 requirement where modes are enforceable"
+    fi
+  fi
+
+  FM_PR_MODE_ENFORCED=0
+  fm_pr_private_file_valid "$file" 600 "$device" \
+    || fail "the Windows mode relaxation refused a safe regular file"
+  ln -s "$file" "$dir/link" 2>/dev/null || true
+  if [ -L "$dir/link" ] && fm_pr_private_file_valid "$dir/link" 600 "$device"; then
+    fail "the Windows mode relaxation accepted a symlink"
+  fi
+  if fm_pr_private_file_valid "$file" 600 "$device-not-this-filesystem"; then
+    fail "the Windows mode relaxation ignored the filesystem device check"
+  fi
+  FM_PR_MODE_ENFORCED=1
+  pass "private mode requirement is exact on POSIX, skipped on Windows, and structural checks still bite"
+}
+
 test_device_renumbered_poll_stays_armed() {
   local dir state out rc original
   dir=$(make_case device-renumber-merged)
@@ -3640,6 +3678,7 @@ test_atomic_interruption_leaves_no_partial_artifact
 test_concurrent_watcher_sees_only_complete_publication
 test_poll_publication_refuses_unsafe_destinations
 test_live_artifact_single_link_and_privacy_validation
+test_private_mode_requirement_follows_the_platform
 test_device_renumbered_poll_stays_armed
 test_device_rerecord_refuses_tampered_artifacts
 test_device_rerecord_serializes_direct_rearm

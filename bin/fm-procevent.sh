@@ -944,11 +944,21 @@ isolate_runner() {  # <wait|detach> <source-id>
 }
 
 require_isolated_group() {  # <role>
-  local role=$1 pgid
+  local role=$1 pgid stat_line
   [ "${FM_PROCEVENT_RUNNER_GROUP:-}" = "$$" ] \
     || die "$role process group was not isolated"
-  pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]') \
-    || die "cannot inspect $role process group"
+  pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$pgid" ]; then
+    # Cygwin/MSYS ps rejects the -o field syntax, which is not the same fact as
+    # an unisolated group. A Linux-compatible /proc/<pid>/stat carries the
+    # process group id as field 5, so read it there before giving up.
+    stat_line=$(cat "/proc/$$/stat" 2>/dev/null) || stat_line=
+    if [ -n "$stat_line" ]; then
+      # After the final ") " the fields continue state ppid pgrp ..., so pgrp
+      # (field 5 overall) is the third token of that remainder.
+      pgid=$(printf '%s\n' "${stat_line##*) }" | awk '{print $3}')
+    fi
+  fi
   [ -n "$pgid" ] || die "cannot inspect $role process group"
   [ "$pgid" = "$$" ] || die "$role does not lead its process group"
   unset FM_PROCEVENT_RUNNER_GROUP
