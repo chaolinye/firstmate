@@ -44,7 +44,12 @@ lib_eval() {  # <fakebin> <expression>
   local -a session_env=()
   [ -z "${FM_TEST_SESSION_ID:-}" ] || session_env+=("CLAUDE_CODE_SESSION_ID=$FM_TEST_SESSION_ID")
   [ -z "${FM_TEST_CLAUDE_PID:-}" ] || session_env+=("CLAUDE_PID=$FM_TEST_CLAUDE_PID")
-  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID ${session_env[@]+"${session_env[@]}"} \
+  # Pi session variables would leak a real interactive session into the
+  # Windows bridge fallback (the engine-table lookup runs real PowerShell);
+  # scrub them so unit cases stay hermetic, exactly as the Claude vars are.
+  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID \
+    -u PI_SESSION_ID -u PI_SESSION_FILE -u PI_CODING_AGENT \
+    ${session_env[@]+"${session_env[@]}"} \
     PATH="$fakebin:$PATH" bash -c "
     . \"\$0\"
     kill() { return \${FM_TEST_KILL_RC:-0}; }
@@ -425,6 +430,79 @@ test_anchor_pid_is_the_model_loop_process_only_for_a_trusted_id() {
     || fail "no anchor pid was resolved for the healthy chain with a trusted id"
   [ "$got" = 710 ] || fail "the healthy chain with a trusted id anchored '$got', expected 710 rather than the front-end"
   pass "session-lock: a trusted id anchors the lock on the model-loop process, anything else on the outermost pid"
+}
+
+# --- unit layer: Pi session-start epoch and nearest-engine disambiguation -----
+# An interactive Pi TUI session launches its engine with no arguments, so the
+# session id is never on a command line; the Windows bridge falls back to the
+# engine table disambiguated by nearest creation time to the session start
+# timestamp embedded in the session file name. These two helpers are pure bash
+# and are exercised here without any Windows process table.
+
+pi_epoch_test() {  # <expr> ; evaluates with a synthetic PI_SESSION_FILE
+  env -u PI_SESSION_FILE PI_SESSION_FILE="$PI_SESSION_FILE" bash -c "
+    . \"\$0\"
+    $1
+  " "$LIB"
+}
+
+PI_SESSION_FILE='C:\\Users\\u\\.pi\\agent\\sessions\\--D--Code-proj--\\2026-10-21T14-40-50-148Z_01a15ee8-61e4-703a-85c1-49855410f41c.jsonl'
+
+test_pi_session_start_epoch_is_parsed_from_the_session_file() {
+  local got
+  got=$(pi_epoch_test 'fm_pi_session_start_epoch') \
+    || fail "the session-start epoch was not parsed from PI_SESSION_FILE"
+  expect_code 1792593650 "$got" "the session-start epoch was not the expected UTC epoch"
+  pass "session-lock: the Pi session-start epoch is parsed from the session file name"
+}
+
+test_pi_session_start_epoch_refuses_a_malformed_file() {
+  local got
+  got=$(PI_SESSION_FILE='sessions/no-ts.jsonl' pi_epoch_test 'fm_pi_session_start_epoch' >/dev/null 2>&1; printf '%s' "$?") \
+    || true
+  expect_code 1 "$got" "a session file without a leading timestamp was accepted"
+  pass "session-lock: a malformed Pi session file yields no session-start epoch"
+}
+
+test_pi_nearest_engine_pid_picks_the_nearest_live_engine() {
+  local table got
+  table='11496 1792582667
+3284 1792593649
+12972 1792594059'
+  got=$(env bash -c "
+    . \"\$0\"
+    fm_pi_nearest_engine_pid 1792593650 \"\$1\"
+  " "$LIB" "$table") || fail "no engine was resolved from the marker table"
+  expect_code "win:3284" "$got" "the nearest engine was not chosen"
+  pass "session-lock: the nearest Pi engine is chosen among concurrent engines"
+}
+
+test_pi_nearest_engine_pid_accepts_a_single_engine() {
+  local got
+  got=$(env bash -c "
+    . \"\$0\"
+    fm_pi_nearest_engine_pid 1792593650 '9999 1792593648'
+  " "$LIB") || fail "a single engine within tolerance was refused"
+  expect_code "win:9999" "$got" "the single engine was not resolved"
+  pass "session-lock: a single Pi engine within tolerance resolves"
+}
+
+test_pi_nearest_engine_pid_refuses_out_of_tolerance_and_ambiguous_tables() {
+  local got
+  # An engine far outside the tolerance (a resumed session) must refuse.
+  got=$(env bash -c "
+    . \"\$0\"
+    fm_pi_nearest_engine_pid 1792593650 '9999 1792500000'
+  " "$LIB" >/dev/null 2>&1; printf '%s' "$?") || true
+  expect_code 1 "$got" "an engine far outside the tolerance was accepted"
+  # Two engines nearly equidistant from the session start are ambiguous.
+  got=$(env bash -c "
+    . \"\$0\"
+    fm_pi_nearest_engine_pid 1792593650 '1111 1792593648
+2222 1792593652'
+  " "$LIB" >/dev/null 2>&1; printf '%s' "$?") || true
+  expect_code 1 "$got" "a near-simultaneous pair was resolved instead of refused"
+  pass "session-lock: out-of-tolerance and ambiguous engine tables refuse"
 }
 
 # --- end-to-end layer: the real Stop auto-arm in real process trees ----------
@@ -1106,6 +1184,11 @@ test_harness_beyond_a_gap_never_owns_the_lock
 test_competing_version_named_session_is_seen_as_live
 test_same_session_id_owns_a_recycled_background_chain
 test_anchor_pid_is_the_model_loop_process_only_for_a_trusted_id
+test_pi_session_start_epoch_is_parsed_from_the_session_file
+test_pi_session_start_epoch_refuses_a_malformed_file
+test_pi_nearest_engine_pid_picks_the_nearest_live_engine
+test_pi_nearest_engine_pid_accepts_a_single_engine
+test_pi_nearest_engine_pid_refuses_out_of_tolerance_and_ambiguous_tables
 test_e2e_version_named_session_claims_the_home
 test_e2e_daemon_parented_session_claims_the_home
 test_e2e_daemon_parented_version_named_session_keeps_its_lock

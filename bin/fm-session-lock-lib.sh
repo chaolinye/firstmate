@@ -271,16 +271,107 @@ FM_WIN_HARNESS_PID_VARS=(CLAUDE_PID)
 # session id the Pi process publishes (PI_SESSION_ID) locates the live process.
 FM_PI_MARKER_RE='@earendil-works/pi-coding-agent|pi-coding-agent/(dist|bundle)'
 
+# Pi publishes no session pid variable, only PI_SESSION_ID (the conversation
+# id of the current session). When the engine is launched with --session the id
+# is on its command line and fm_win_pi_harness_pid finds it there; an
+# interactive TUI session launches the engine with no arguments, so the id is
+# only in the tool-shell environment (PI_SESSION_ID) and never on any command
+# line. In that case the engine is found by the pi-coding-agent marker alone
+# and disambiguated among concurrent engines by nearest creation time to the
+# session start timestamp embedded in the session file name (PI_SESSION_FILE).
+# The found pid is confirmed live in the Windows table and matched as a harness
+# before it is printed.
+
+# Print this session's start time as a UTC epoch, derived from the session file
+# name in $PI_SESSION_FILE (<YYYY-MM-DD>T<HH-MM-SS>-<mmm>Z_<sid>.jsonl), or
+# return 1. The embedded timestamp is the session start, minted when the
+# session id was generated, so it is close to the engine process creation time
+# for a freshly launched session and far from it for a resumed one.
+FM_PI_SESSION_EPOCH_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}'
+# A freshly launched engine is created within a few seconds of the session
+# start; anything farther is treated as no match rather than a guess.
+FM_PI_ENGINE_MAX_AGE=300
+# The nearest engine must be clearly nearer than the second-nearest, so two
+# sessions launched within seconds of each other refuse rather than risk
+# attributing one session's engine to the other. Refusing leaves both read-only,
+# which is the safe direction for an ambiguous Windows identity.
+FM_PI_ENGINE_GAP=10
+
+fm_pi_session_start_epoch() {  # -> epoch, or 1
+  local file=${PI_SESSION_FILE:-} base ts iso epoch
+  [ -n "$file" ] || return 1
+  base=${file##*[\\/]}
+  ts=$(printf '%s' "$base" | grep -oE "$FM_PI_SESSION_EPOCH_RE") || return 1
+  # The captured form is <YYYY-MM-DD>T<HH-MM-SS>; date needs colons and a Z
+  # suffix to treat the timestamp as UTC.
+  iso="${ts:0:10}T${ts:11:2}:${ts:14:2}:${ts:17:2}Z"
+  epoch=$(date -d "$iso" +%s 2>/dev/null) || return 1
+  case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$epoch"
+}
+
+# Print "pid epoch" lines for every live Windows process whose command line
+# carries the pi-coding-agent package marker, or return 1 when the table cannot
+# be read. Each line is one pi engine: the pid and its creation time as a UTC
+# epoch, so a caller can pick the engine nearest this session's start.
+# shellcheck disable=SC2317 # Not all consumers exist in every sourced context.
+FM_PI_EPOCH_EPOCH='1970-01-01'
+fm_pi_marker_engine_table() {  # -> "pid epoch" lines
+  local out
+  # The marker filter also matches the query's own spawned processes, whose
+  # command line carries this very -Command text; exclude them so a transient
+  # powershell or bash cannot be picked as the session's engine.
+  out=$(powershell -NoProfile -NonInteractive -Command \
+    "Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*pi-coding-agent*' -and \$_.CommandLine -notlike '*Get-CimInstance*' } | ForEach-Object { \$epoch = \$_.CreationDate.ToUniversalTime().Subtract([datetime]::ParseExact('$FM_PI_EPOCH_EPOCH','yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture)).TotalSeconds; Write-Output (\$_.ProcessId.ToString() + ' ' + [int64]\$epoch) }" 2>/dev/null) || return 1
+  printf '%s\n' "$out"
+}
+
+# Print the tagged Windows pid of the pi engine whose creation time is nearest
+# this session's start epoch $1, given "pid epoch" lines $2, or return 1. The
+# nearest match must fall within FM_PI_ENGINE_MAX_AGE seconds of the session
+# start and be clearly nearer than the second-nearest (FM_PI_ENGINE_GAP), so a
+# resumed session or a near-simultaneous pair refuses instead of guessing.
+fm_pi_nearest_engine_pid() {  # <session-epoch> <pid-epoch-lines> -> win:<pid>
+  local target=$1 lines=$2 pid epoch best='' best_delta='' second='' delta
+  while read -r pid epoch; do
+    pid=${pid%$'\r'}  # PowerShell emits CRLF; strip the carriage return.
+    epoch=${epoch%$'\r'}
+    case "$pid:$epoch" in
+      *[!0-9]:*|*:*[!0-9]) continue ;;
+    esac
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    case "$epoch" in ''|*[!0-9]*) continue ;; esac
+    delta=$(( epoch - target ))
+    [ "$delta" -lt 0 ] && delta=$(( -delta ))
+    if [ -z "$best" ] || [ "$delta" -lt "$best_delta" ]; then
+      second=$best_delta
+      best=$pid
+      best_delta=$delta
+    elif [ -z "$second" ] || [ "$delta" -lt "$second" ]; then
+      second=$delta
+    fi
+  done <<EOF
+$lines
+EOF
+  [ -n "$best" ] || return 1
+  [ "$best_delta" -le "$FM_PI_ENGINE_MAX_AGE" ] || return 1
+  if [ -n "$second" ]; then
+    # A second engine that is nearly as close as the best is ambiguous;
+    # refuse rather than risk attributing another session's engine to this one.
+    [ $(( second - best_delta )) -ge "$FM_PI_ENGINE_GAP" ] || return 1
+  fi
+  printf '%s%s\n' "$FM_WIN_PID_PREFIX" "$best"
+}
+
 # Print the tagged Windows pid of this session's live Pi harness process, or
-# return 1. Pi publishes no session pid variable, only PI_SESSION_ID (the
-# conversation id passed as --session on its own command line). The command
-# line is scanned for that exact id AND the pi-coding-agent marker, so an
-# unrelated process carrying the id cannot be mistaken for the harness, and a
-# recycled pid is rejected because the marker must accompany it. The found pid
-# is then confirmed live in the Windows table and matched as a harness before
-# it is printed.
+# return 1. The command line is scanned for the exact session id AND the
+# pi-coding-agent marker first, so a --session launch resolves exactly; when
+# that finds nothing (an interactive TUI session carries the id only in the
+# environment), the marker-only engine table is disambiguated by nearest
+# creation time to the session start. The found pid is then confirmed live in
+# the Windows table and matched as a harness before it is printed.
 fm_win_pi_harness_pid() {  # -> tagged win:<pid>, or 1
-  local sid=${PI_SESSION_ID:-} pids pid line
+  local sid=${PI_SESSION_ID:-} pids pid line target table
   [ -n "$sid" ] || return 1
   # Session ids are conversational UUIDs; refuse anything that could break out
   # of the PowerShell filter below.
@@ -299,7 +390,12 @@ fm_win_pi_harness_pid() {  # -> tagged win:<pid>, or 1
     printf '%s%s\n' "$FM_WIN_PID_PREFIX" "$pid"
     return 0
   done
-  return 1
+  # Interactive TUI sessions launch the engine with no arguments, so the
+  # session id is never on a command line; fall back to the marker table
+  # disambiguated by nearest creation time to the session start.
+  target=$(fm_pi_session_start_epoch) || return 1
+  table=$(fm_pi_marker_engine_table) || return 1
+  fm_pi_nearest_engine_pid "$target" "$table"
 }
 
 # Print this session's harness as one tagged Windows pid, or return 1.
