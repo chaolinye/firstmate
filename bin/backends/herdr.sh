@@ -832,11 +832,30 @@ fm_backend_herdr_presentation_lock_namespace_valid() {
 # literal path. Single owner for every socket-identity comparison in this
 # adapter (the presentation session lock and the launcher-identity same-session
 # proof both use it).
+#
+# herdr injects HERDR_SOCKET_PATH and reports session sockets in Windows form
+# (C:\... or C:/...) on MSYS/Git-Bash hosts, so a drive-letter path is
+# normalized to the Unix form the adapter compares when cygpath is available.
+# cygpath -m folds backslashes to forward slashes first, so the same
+# [A-Za-z]:/* match accepts either spelling. A drive-letter path without a
+# separator is relative and refused; on a platform without cygpath
+# (Linux/macOS) a Windows-form path is refused exactly as before.
 fm_backend_herdr_canonical_socket_path() {  # <socket-path>
   local socket=$1 sock_dir sock_base
   [ -n "$socket" ] || return 1
   case "$socket" in
     /*) ;;
+    [A-Za-z]:*)
+      if command -v cygpath >/dev/null 2>&1; then
+        socket=$(cygpath -m "$socket" 2>/dev/null) || return 1
+        case "$socket" in
+          [A-Za-z]:/*) socket=$(cygpath -u "$socket" 2>/dev/null) || return 1 ;;
+          *) return 1 ;;
+        esac
+      else
+        return 1
+      fi
+      ;;
     *) return 1 ;;
   esac
   sock_dir=$(dirname "$socket")

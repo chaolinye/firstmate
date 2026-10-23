@@ -1121,6 +1121,82 @@ test_launcher_identity_refuses_a_workspace_missing_from_the_session() {
   pass "fm_backend_herdr_launcher_identity: refuses when the launcher's workspace is gone from its own session"
 }
 
+# --- canonical_socket_path: one spelling per socket ------------------------
+#
+# fm_backend_herdr_canonical_socket_path normalizes one absolute socket path
+# so two spellings of the same socket compare equal. On MSYS/Git-Bash hosts
+# herdr injects and reports Windows-form paths (C:\... or C:/...), which must
+# normalize to the same Unix form as a /c/... spelling before the launcher
+# same-session proof compares them. A relative path is always refused. On a
+# platform without cygpath a Windows-form path is refused (no conversion is
+# possible), matching the no-cygpath refusal contract.
+
+test_canonical_socket_path_keeps_a_unix_form_absolute_path() {
+  local out rc
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; printf "%s" "$(fm_backend_herdr_canonical_socket_path /tmp/fm-herdr-unit/fmtest.sock)"' "$ROOT")
+  rc=$?
+  expect_code 0 "$rc" "a Unix-form absolute socket path must canonicalize"
+  [ "$out" = /tmp/fm-herdr-unit/fmtest.sock ] \
+    || fail "unix-form socket path should pass through unchanged, got '$out'"
+  pass "fm_backend_herdr_canonical_socket_path: keeps a Unix-form absolute path as-is"
+}
+
+test_canonical_socket_path_normalizes_a_windows_backslash_form_when_cygpath() {
+  local out rc
+  if command -v cygpath >/dev/null 2>&1; then
+    out=$(bash -c '. "$0/bin/backends/herdr.sh"; printf "%s" "$(fm_backend_herdr_canonical_socket_path "C:\\Users\\fmtest\\herdr.sock")"' "$ROOT")
+    rc=$?
+    expect_code 0 "$rc" "a Windows backslash-form absolute socket path must canonicalize when cygpath exists"
+    [ "$out" = /c/Users/fmtest/herdr.sock ] \
+      || fail "Windows backslash form should normalize to the Unix form, got '$out'"
+  else
+    out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_canonical_socket_path "C:\\Users\\fmtest\\herdr.sock"' "$ROOT" 2>&1)
+    rc=$?
+    expect_code 1 "$rc" "a Windows-form path must be refused where cygpath is absent"
+  fi
+  pass "fm_backend_herdr_canonical_socket_path: Windows backslash form resolves like its Unix spelling"
+}
+
+test_canonical_socket_path_normalizes_a_windows_forward_slash_form_when_cygpath() {
+  local out rc
+  if command -v cygpath >/dev/null 2>&1; then
+    out=$(bash -c '. "$0/bin/backends/herdr.sh"; printf "%s" "$(fm_backend_herdr_canonical_socket_path "C:/Users/fmtest/herdr.sock")"' "$ROOT")
+    rc=$?
+    expect_code 0 "$rc" "a Windows forward-slash absolute socket path must canonicalize when cygpath exists"
+    [ "$out" = /c/Users/fmtest/herdr.sock ] \
+      || fail "Windows forward-slash form should normalize to the Unix form, got '$out'"
+  else
+    out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_canonical_socket_path "C:/Users/fmtest/herdr.sock"' "$ROOT" 2>&1)
+    rc=$?
+    expect_code 1 "$rc" "a Windows-form path must be refused where cygpath is absent"
+  fi
+  pass "fm_backend_herdr_canonical_socket_path: Windows forward-slash form resolves like its Unix spelling"
+}
+
+test_canonical_socket_path_refuses_a_relative_drive_path() {
+  local out rc
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_canonical_socket_path "C:relative"' "$ROOT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "a drive-letter path without a separator is relative and must be refused"
+  pass "fm_backend_herdr_canonical_socket_path: refuses a drive-letter relative path"
+}
+
+test_canonical_socket_path_refuses_a_plain_relative_path() {
+  local out rc
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_canonical_socket_path "relative.sock"' "$ROOT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "a plain relative path must be refused"
+  pass "fm_backend_herdr_canonical_socket_path: refuses a plain relative path"
+}
+
+test_canonical_socket_path_refuses_an_empty_path() {
+  local out rc
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_canonical_socket_path ""' "$ROOT" 2>&1)
+  rc=$?
+  expect_code 1 "$rc" "an empty path must be refused"
+  pass "fm_backend_herdr_canonical_socket_path: refuses an empty path"
+}
+
 # --- workspace_ensure placement ---------------------------------------------
 
 test_workspace_ensure_prefers_the_launcher_over_the_first_label_match() {
@@ -5981,6 +6057,12 @@ test_launcher_identity_refuses_a_pane_from_another_server_socket
 test_launcher_identity_refuses_an_unreadable_pane
 test_launcher_identity_refuses_a_pane_and_tab_that_disagree
 test_launcher_identity_refuses_a_workspace_missing_from_the_session
+test_canonical_socket_path_keeps_a_unix_form_absolute_path
+test_canonical_socket_path_normalizes_a_windows_backslash_form_when_cygpath
+test_canonical_socket_path_normalizes_a_windows_forward_slash_form_when_cygpath
+test_canonical_socket_path_refuses_a_relative_drive_path
+test_canonical_socket_path_refuses_a_plain_relative_path
+test_canonical_socket_path_refuses_an_empty_path
 test_workspace_ensure_prefers_the_launcher_over_the_first_label_match
 test_workspace_ensure_refuses_an_ambiguous_label_with_no_launcher
 test_workspace_ensure_other_home_ignores_the_launcher_identity
