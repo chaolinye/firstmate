@@ -40,6 +40,39 @@ The live guard touches only a disposable home and submits no prompt.
 Pi was the only installed primary CLI on this host; Claude, Codex, OpenCode, pi-signed, omp, Grok, Kimi, and Cursor remain unverified on Windows by this run.
 The Linux/macOS tmux drift guard remains unchanged.
 
+## Windows Herdr process host
+
+Verified on 2026-10-25 on Windows 11, Git for Windows Bash 5.2.37, Herdr 0.9.0 (native Windows build), Node 24.x, and PowerShell 5.1.
+The Windows process-host contract lives in [`docs/herdr-backend.md`](../herdr-backend.md#windows-hosts-git-bashmsys); `bin/backends/herdr.sh` owns it.
+
+Evidence captured against a real isolated lab Herdr session
+(`tests/fm-backend-herdr-windows-host-live-e2e.test.sh`):
+
+```text
+ok - Windows process table carries every native row, including this shell
+ok - bare-shell proof and idle-state proof read the native pid space
+ok - Windows harness identity: Pi bundle is an agent, bash.exe is a shell, a stranger is other
+ok - idle-shell proof settles on a native Windows bash pane (pid ...)
+ok - agent-free pane proof reads an idle bash pane as shell
+ok - foreground verdicts route through the Windows harness identity rule
+ok - pane-death close ends a native Windows shell and Herdr drops the pane
+```
+
+Observed host facts the proofs rest on:
+
+- Cygwin `ps` (Git for Windows) rejects `-o` field syntax; MSYS `kill -0`
+  refuses native pids with "No such process".
+- `pane process-info` reports native Windows pids; the pane shell is
+  `bin\bash.exe` with the real `usr\bin\bash.exe` as its one leaf child.
+- `taskkill -F -PID <native-pid>` on the pane shell drops the pane immediately
+  (`pane_not_found`), matching the POSIX pane-death path.
+- A Pi launched through the npm shim appears as `node.exe` with the
+  `pi-coding-agent` bundle path in its command line; `fm_windows_harness_process_matches`
+  (session-lock owner) identifies it.
+
+The same suite runs the POSIX fixtures on Linux/macOS; the Windows live
+regression skips off a Windows host.
+
 ## Polytoken worker lifecycle
 
 Verified on 2026-10-14 with Polytoken 0.9.0 on macOS arm64 using the tmux worker path.

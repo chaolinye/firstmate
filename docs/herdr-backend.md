@@ -27,7 +27,62 @@ Herdr provides the terminal session while Treehouse continues to provide task wo
 | How blocked transitions arrive and what happens without protocol 16 | [Push events and polling fallback](#push-events-and-polling-fallback) |
 | Where the away daemon runs and how it stops | [Away-mode supervisor support](#away-mode-supervisor-support) |
 | Stopping or deleting Herdr sessions during verification | [Destructive lab safety](#destructive-lab-safety) |
+| Windows hosts (Git Bash/MSYS): how processes and signals are read | [Windows hosts](#windows-hosts-git-bashmsys) |
 | Known limits and the test suite | [Active limits](#active-limits) and [Regression entry points](#regression-entry-points) |
+
+## Windows hosts (Git Bash/MSYS)
+
+On a Windows host Herdr is a native binary, so every pid it reports - the pane's
+shell pid, the foreground process group, every foreground pid - is a NATIVE
+Windows pid. Two primitives this adapter otherwise relies on cannot reach that
+pid space:
+
+- Git Bash's Cygwin `ps` has no `-o` field syntax (`ps: unknown option -- o`,
+  verified on Git for Windows), so the POSIX process-table proofs cannot run.
+- MSYS `kill` addresses only MSYS pids; `kill -0 <native-pid>` refuses with
+  "No such process", so POSIX signal delivery cannot end a pane shell.
+
+`bin/backends/herdr.sh` therefore owns a Windows process host whose contract is:
+
+- `fm_backend_herdr_windows_proc_table` reads one PowerShell `Win32_Process`
+  snapshot - the same source `bin/fm-session-lock-lib.sh` uses for session-lock
+  liveness - projected as `<pid>\t<ppid>\t<comm>\t<command-line>\t<state>\t<start>`.
+  `comm` has no `.exe` suffix, `state` is the main thread's `ThreadState` (the
+  analogue of ps's S/I sleeping shell), and `start` is the creation time the
+  conservative attribution rule orders against.
+- `fm_backend_herdr_windows_process_verdict` reuses the session-lock owner's
+  verified Windows harness matcher (`fm_windows_harness_process_matches`), which
+  normalizes backslashes, strips `.exe`, and owns the node-bundle Pi/Claude/OMP
+  script paths - so a Pi launched through the npm shim (kernel name `node.exe`)
+  still reads as an agent here exactly as it does in the ancestry walk.
+- `fm_backend_herdr_signal_pane_shell` is the only signal delivery point. A
+  Windows console process cannot be closed gracefully (`taskkill -PID` refuses
+  without `/F`), so HUP/TERM ask for the graceful close and KILL asks for the
+  forced termination Herdr's pane-death path observes.
+
+Two Windows-specific process facts shape the proofs:
+
+- Git for Windows runs an interactive tab shell as `bin\bash.exe` (the launcher
+  Herdr reports) executing the real `usr\bin\bash.exe` as its only child, so the
+  idle-shell proof allows exactly one leaf child that is itself a recognized
+  shell. Anything else under the shell - a harness, or a shell that spawned
+  anything - keeps the proof refused.
+- A Windows launch chain can lose its middle: the npm shim and a launcher shell
+  exit and reparent the harness they started, so the strict parent walk cannot
+  attribute such a process to the pane while it also cannot exclude it. A
+  harness process whose parent is already gone from the table and which started
+  after the pane shell therefore reads as an `agent` verdict (never a
+  shell-only pane): the fail-safe direction, because a false shell-only verdict
+  would license closing a live agent.
+
+An explicit `FM_HERDR_PS_BIN` wins over the Windows snapshot on every host: a
+caller that sets it declares its own POSIX-shaped process source, and the
+POSIX paths (and the POSIX fixture unit tests) stay intact.
+
+The live regression for this contract is
+[`tests/fm-backend-herdr-windows-host-live-e2e.test.sh`](../tests/fm-backend-herdr-windows-host-live-e2e.test.sh):
+it proves the table, the bare-shell and idle-state proofs, the harness verdicts,
+and the pane-death close against a real isolated Herdr session.
 
 ## Setup
 

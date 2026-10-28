@@ -320,15 +320,25 @@ test_version_check_refuses_old_protocol() {
 }
 
 test_version_check_refuses_missing_herdr() {
-  local dir out status
+  local dir out status path
   dir="$TMP_ROOT/version-missing"; mkdir -p "$dir/empty-fakebin"
   # Hermetic PATH: the fakebin carries only bash (so the inner `bash -c`
   # still resolves) and no system dir, so a real herdr installed under
   # /usr/bin (or /bin -> usr/bin) cannot leak into this "not installed"
   # simulation. fm_backend_herdr_tool_check needs no external tool on this
   # path: `command -v` is a builtin and it short-circuits on herdr first.
+  #
+  # A Windows host cannot run the hermetic form at all: a lone bash symlink has
+  # no MSYS runtime or /usr/bin beside it, so the inner shell produces no output
+  # and the assertion below would fail on an empty string. There the system
+  # directories stay on PATH - no herdr lives in them - so the refusal is still
+  # exercised against a real herdr-free search path.
   ln -sf "$(command -v bash)" "$dir/empty-fakebin/bash"
-  out=$( PATH="$dir/empty-fakebin" \
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) path="$dir/empty-fakebin:/usr/bin:/bin" ;;
+    *) path="$dir/empty-fakebin" ;;
+  esac
+  out=$( PATH="$path" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_version_check' "$ROOT" 2>&1 )
   status=$?
   [ "$status" -ne 0 ] || fail "version_check should refuse when herdr is not installed"
@@ -521,7 +531,9 @@ stale_registration_case() {  # <dir-suffix> <agent_status> <process-info-body|->
 }
 
 shell_only_process_info() {  # <shell-pid>
-  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"zsh","argv0":"zsh","argv":["-zsh"],"cmdline":"-zsh"}]}}}' "$1" "$1" "$1"
+  local pid
+  pid=$(herdr_fixture_pid "$1")
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"zsh","argv0":"zsh","argv":["-zsh"],"cmdline":"-zsh"}]}}}' "$pid" "$pid" "$pid"
 }
 
 test_stale_registration_over_a_shell_only_pane_is_agent_free() {
@@ -760,7 +772,7 @@ test_registered_agent_with_an_unreadable_process_view_is_unknown() {
 }
 
 test_registered_agent_with_an_empty_foreground_over_a_real_shell_settles_via_descendant_walk() {
-  local sleep_bin shell_pid out
+  local sleep_bin shell_pid out fixture_pid
   sleep_bin=$(command -v sleep) || fail "sleep not found"
   # A real, childless shell process stands in for the pane's shell, and the
   # foreground list is empty - the exec-to-shell handoff shape the flake fix
@@ -770,8 +782,9 @@ test_registered_agent_with_an_empty_foreground_over_a_real_shell_settles_via_des
   # unreadable.
   "$sleep_bin" 300 &
   shell_pid=$!
+  fixture_pid=$(herdr_fixture_pid "$shell_pid")
   out=$(stale_registration_case empty-foreground idle \
-    "$(printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[]}}}' "$shell_pid" "$shell_pid")")
+    "$(printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p2","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[]}}}' "$fixture_pid" "$fixture_pid")")
   kill "$shell_pid" 2>/dev/null || true
   [ "$out" = "stale-agent dead refused" ] \
     || fail "an empty foreground list over a real childless shell must settle to stale-agent via the descendant walk, not unreadable, got '$out'"
@@ -2421,8 +2434,21 @@ SH
   : > "$dir/mover.log"
 }
 
+# herdr_fixture_pid: the pid a Herdr process-info fixture must name. Herdr
+# reports NATIVE Windows pids, while a Git Bash stand-in process is addressed by
+# its MSYS pid, so on a Windows host the fixture names the native pid while the
+# kill and liveness assertions keep using the MSYS one.
+herdr_fixture_pid() {  # <msys-pid>
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) cat "/proc/$1/winpid" 2>/dev/null || printf '%s' "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 death_process_info_fixture() {  # <pane> <pid>
-  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"zsh","argv0":"zsh"}]}}}\n' "$1" "$2" "$2" "$2"
+  local pid
+  pid=$(herdr_fixture_pid "$2")
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"zsh","argv0":"zsh"}]}}}\n' "$1" "$pid" "$pid" "$pid"
 }
 
 test_projection_close_emptying_after_focus_uses_pane_death_without_move() {
@@ -2696,7 +2722,7 @@ test_projection_close_busy_pane_falls_back_to_plain_close() {
   cp "$resp/1.out" "$resp/6.out"
   sleep 300 & bgpid=$!
   # The pane still has a foreground agent, so the idle-shell proof refuses.
-  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w2:p2","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"zsh","argv0":"zsh"},{"pid":99999,"name":"pi","argv0":"pi"}]}}}\n' "$bgpid" "$bgpid" "$bgpid" > "$resp/7.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w2:p2","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":%s,"name":"zsh","argv0":"zsh"},{"pid":99999,"name":"pi","argv0":"pi"}]}}}\n' "$(herdr_fixture_pid "$bgpid")" "$(herdr_fixture_pid "$bgpid")" "$(herdr_fixture_pid "$bgpid")" > "$resp/7.out"
   printf '%s\n' '{"error":{"code":"pane_not_found"}}' > "$resp/9.out"
   printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","active_tab_id":"w1:t1","focused":true}]}}' > "$resp/10.out"
   printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","focused":true}]}}' > "$resp/11.out"
@@ -2728,7 +2754,7 @@ test_projection_close_transient_prompt_helper_settles_then_uses_pane_death() {
   sleep 300 & bgpid=$!
   # Sample 1: the shell is transiently redrawing its prompt (real 0.7.5 shape:
   # a helper such as starship rides along as a second foreground process).
-  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w2:p2","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":99998,"name":"starship","argv":["/usr/local/bin/starship","prompt","--continuation"]},{"pid":%s,"name":"zsh","argv0":"zsh"}]}}}\n' "$bgpid" "$bgpid" "$bgpid" > "$resp/7.out"
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w2:p2","shell_pid":%s,"foreground_process_group_id":%s,"foreground_processes":[{"pid":99998,"name":"starship","argv":["/usr/local/bin/starship","prompt","--continuation"]},{"pid":%s,"name":"zsh","argv0":"zsh"}]}}}\n' "$(herdr_fixture_pid "$bgpid")" "$(herdr_fixture_pid "$bgpid")" "$(herdr_fixture_pid "$bgpid")" > "$resp/7.out"
   # Sample 2: the helper finished; the shell is provably alone and idle.
   death_process_info_fixture w2:p2 "$bgpid" > "$resp/8.out"
   printf '%s\n' '{"error":{"code":"pane_not_found"}}' > "$resp/9.out"
