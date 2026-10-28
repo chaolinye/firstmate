@@ -356,10 +356,16 @@ fm_pr_file_identity() {
 }
 
 fm_pr_sha256() {
+  # The file is fed on stdin. GNU coreutils escapes a filename containing a
+  # backslash by prefixing the whole output line with one, so a Windows-form
+  # path (FM_HOME=D:\...) would turn the reported digest into "\<hex>" and
+  # break every caller that compares it. Stdin makes the name "-" and the
+  # digest unambiguous on every platform.
+  [ -f "$1" ] || return 1
   if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    shasum -a 256 < "$1" 2>/dev/null | awk '{print $1}'
   elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    sha256sum < "$1" 2>/dev/null | awk '{print $1}'
   else
     return 1
   fi

@@ -5,10 +5,15 @@ FM_CUSTOM_CHECK_SNAPSHOT=
 
 fm_custom_check_sha256() {
   local file=$1
+  # Feed the file on stdin: GNU coreutils prefixes the whole output line with a
+  # backslash when the filename contains one, so a Windows-form
+  # FM_HOME=D:\... path would yield "\<hex>" and never match a recorded
+  # digest, which made every trusted check look unauthenticated on MSYS.
+  [ -f "$file" ] || return 1
   if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+    shasum -a 256 < "$file" 2>/dev/null | awk '{print $1}'
   elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" 2>/dev/null | awk '{print $1}'
+    sha256sum < "$file" 2>/dev/null | awk '{print $1}'
   else
     return 1
   fi
