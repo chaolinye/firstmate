@@ -1920,8 +1920,26 @@ fm_autoarm_ledger_read() {  # <state-dir>
 
 # True when <ancestor> is <pid> itself or appears in <pid>'s parent chain,
 # walking at most 16 hops up toward init.
+# A Windows host reads the chain from one native process snapshot - the same
+# source the session-lock identity owner walks - because Cygwin ps rejects the
+# `-o` field syntax the POSIX walk depends on. A pid that snapshot cannot
+# resolve refuses, exactly like an unresolved POSIX hop.
 fm_pid_descends_from() {  # <pid> <ancestor>
-  local pid=$1 ancestor=$2
+  local pid=$1 ancestor=$2 hop
+  case "${_FM_UNAME:-unknown}" in
+    windows|MINGW*|MSYS*|CYGWIN*)
+      _fm_wake_require_session_lock || return 1
+      fm_windows_process_snapshot || return 1
+      for hop in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+        [ "$pid" = "$ancestor" ] && return 0
+        fm_windows_process_read "$pid" || return 1
+        pid=$FM_WIN_PROC_PARENT
+        case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$pid" -ge 1 ] || return 1
+      done
+      return 1
+      ;;
+  esac
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
     [ "$pid" = "$ancestor" ] && return 0
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
