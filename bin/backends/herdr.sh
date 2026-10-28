@@ -1350,6 +1350,218 @@ FMEOF
   fi
 }
 
+# --- Windows (Git Bash/MSYS) process host -------------------------------------
+#
+# On Windows Herdr is a native binary, so every pid it reports - the pane's
+# shell pid, the foreground process group, every foreground pid - is a NATIVE
+# Windows pid. That pid space is unreachable from the two POSIX primitives this
+# adapter otherwise uses: Git Bash's Cygwin `ps` has no `-o` field syntax
+# (`ps: unknown option -- o`, verified on Git for Windows), and MSYS `kill`
+# addresses only MSYS pids (`kill -0 <native-pid>` refuses with "No such
+# process", verified on the same host). The helpers below own the Windows
+# replacements, and no other function in this adapter may assume POSIX `ps` or
+# `kill` on a Windows host.
+#
+# fm_backend_herdr_windows_proc_table reads one PowerShell Win32_Process
+# snapshot - the source bin/fm-session-lock-lib.sh already owns for
+# session-lock liveness - projected into the same rows the POSIX paths read
+# from ps: pid, ppid, comm, command line, and, for shell-named processes only,
+# the main thread's state, which is the Windows analogue of ps's S/I sleeping
+# shell (an idle prompt sits in Wait/Ready/Standby, anything still computing is
+# Running).
+#
+# fm_backend_herdr_windows_process_verdict reuses the session-lock owner's
+# verified Windows harness matcher (bin/fm-session-lock-lib.sh
+# fm_windows_harness_process_matches), which normalizes backslashes, strips a
+# `.exe` suffix, and owns the node-bundle Pi/Claude/OMP script paths - so a Pi
+# launched through the npm shim, whose kernel name is `node.exe`, still reads
+# as an agent here exactly as it does in the ancestry walk.
+#
+# fm_backend_herdr_signal_pane_shell is the only signal delivery point. A
+# Windows console process cannot be closed gracefully (`taskkill -PID` refuses
+# without -F, verified), so HUP/TERM ask for the graceful close and KILL asks
+# for the forced termination Herdr's pane-death path observes.
+FM_BACKEND_HERDR_HOST_PLATFORM=
+fm_backend_herdr_windows_host() {
+  if [ -z "$FM_BACKEND_HERDR_HOST_PLATFORM" ]; then
+    FM_BACKEND_HERDR_HOST_PLATFORM=${FM_BACKEND_HERDR_WINDOWS_HOST_OVERRIDE:-$(uname -s 2>/dev/null || printf 'unknown')}
+  fi
+  case "$FM_BACKEND_HERDR_HOST_PLATFORM" in
+    windows|MINGW*|MSYS*|CYGWIN*) return 0 ;;
+  esac
+  return 1
+}
+
+# True when the process SOURCE must be the Windows snapshot. An explicit
+# FM_HERDR_PS_BIN wins on every host: it is the documented portable seam, and a
+# caller that sets it has a POSIX-shaped process source of its own - a procps
+# build, or a test fake - which is exactly what the POSIX paths read.
+fm_backend_herdr_uses_windows_proc_table() {
+  [ -z "${FM_HERDR_PS_BIN:-}" ] || return 1
+  fm_backend_herdr_windows_host
+}
+
+# One tab-separated row per native process:
+#   <pid>\t<ppid>\t<comm>\t<command-line>\t<state>\t<start-ticks>
+# comm carries no path and no `.exe` suffix, the command line is the
+# OS-reported one with tabs and newlines folded to spaces (empty when the OS
+# reports none), state is the process's main thread state - the Windows
+# analogue of the S/I letter ps reports for a sleeping shell - and start-ticks
+# is the process creation time the process table orders against. Empty output
+# and non-zero when PowerShell is missing or fails, so every caller fails closed
+# instead of reading an empty table as "no process".
+fm_backend_herdr_windows_proc_table() {
+  local exe rows
+  if [ -n "${FM_BACKEND_HERDR_WINDOWS_TABLE_BIN:-}" ]; then
+    # Portable-test seam: no production caller sets it, and a caller that does
+    # supplies a program printing these same six columns.
+    rows=$("$FM_BACKEND_HERDR_WINDOWS_TABLE_BIN" 2>/dev/null | tr -d '\r') || return 1
+  else
+    exe=$(command -v powershell 2>/dev/null || command -v powershell.exe 2>/dev/null \
+      || command -v pwsh 2>/dev/null || command -v pwsh.exe 2>/dev/null) || return 1
+    # shellcheck disable=SC2016 # PowerShell, not Bash, expands this script.
+    rows=$("$exe" -NoProfile -NonInteractive -Command '
+      $ErrorActionPreference = "Stop"
+      [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+      $live = @{}
+      foreach ($g in Get-Process -ErrorAction SilentlyContinue) { $live[[int]$g.Id] = $g }
+      Get-CimInstance Win32_Process | ForEach-Object {
+        $comm = [string]$_.Name
+        if ($comm -match "\.exe$") { $comm = $comm.Substring(0, $comm.Length - 4) }
+        $state = ""
+        $g = $live[[int]$_.ProcessId]
+        if ($null -ne $g) {
+          $t = $g.Threads | Sort-Object Id | Select-Object -First 1
+          if ($null -ne $t) { $state = [string]$t.ThreadState }
+        }
+        $start = 0
+        if ($null -ne $_.CreationDate) { $start = $_.CreationDate.Ticks }
+        $cmdline = ([string]$_.CommandLine) -replace "[\t\r\n]", " "
+        [string]$_.ProcessId + "`t" + [string]$_.ParentProcessId + "`t" + $comm + "`t" + $cmdline + "`t" + $state + "`t" + [string]$start
+      }' 2>/dev/null | tr -d '\r') || return 1
+  fi
+  [ -n "$rows" ] || return 1
+  printf '%s\n' "$rows"
+}
+
+# Print the harness processes this pane CANNOT exclude on a Windows host: rows
+# that are neither the pane shell nor a descendant of it, whose own parent is
+# already gone from the table, and which started after the pane shell did.
+#
+# Why this exists: a Windows launch chain loses its middle - the npm shim and a
+# launcher shell exit and reparent the harness they started - so the strict
+# parent walk cannot attribute such a process to the pane, while it also cannot
+# prove it belongs elsewhere. Reporting it keeps the pane out of the shell-only
+# verdict, which is the fail-safe direction: a false shell-only verdict would
+# license closing a live agent, while a false "still occupied" verdict only
+# refuses a cleanup the caller retries later.
+fm_backend_herdr_windows_unattributable_processes() {
+  local rows=$1 shell=$2
+  printf '%s\n' "$rows" | awk -F'\t' -v shell="$shell" '
+    {
+      n++
+      pid[n] = $1; ppid[n] = $2; comm[n] = $3; args[n] = $4; start[n] = $6
+      have[$1] = 1
+      if ($1 == shell) shell_start = $6
+    }
+    END {
+      if (shell_start == "") exit 0
+      want[shell] = 1
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (i = 1; i <= n; i++) {
+          if ((ppid[i] in want) && !(pid[i] in want)) { want[pid[i]] = 1; changed = 1 }
+        }
+      }
+      for (i = 1; i <= n; i++) {
+        if (pid[i] in want) continue
+        if (ppid[i] in have) continue
+        if (start[i] == "" || start[i] <= shell_start) continue
+        printf "%s\t%s\t%s\t%s\n", pid[i], comm[i], args[i], start[i]
+      }
+    }'
+}
+
+# agent|shell|other for one Windows process, from Herdr's own process name plus
+# its command line. The verified Windows matcher runs first because it owns the
+# node-bundle Pi/Claude/OMP script paths and the backslash/`.exe`
+# normalization; the shared classifier then covers the shapes that matcher
+# leaves to the Portable side (a bare harness name, or an install path carrying
+# the harness component), so the two surfaces cannot disagree about a pane.
+# Any single harness surface wins: a false negative would let a live agent's
+# pane read as shell-only.
+fm_backend_herdr_windows_process_verdict() {  # <name> <command-line> [argv0]
+  local name=${1//\\//} args=${2:-} given_argv0=${3:-} norm base argv0 verdict
+  if fm_windows_harness_process_matches "$name" "$args"; then
+    printf 'agent'
+    return 0
+  fi
+  # The rest of the identity rules are the shared, POSIX-shaped ones, so they
+  # read a Windows command line only after its separators and executable
+  # suffix are normalized: backslash paths have no basename to the shared
+  # path-component rules, and no Windows name matches the bare-name vocabulary.
+  norm=${args//\\//}
+  base=${name##*/}
+  base=${base%.[eE][xX][eE]}
+  base=${base#-}
+  if [ -n "$given_argv0" ]; then
+    # Herdr answers argv0 as its own field, which is unambiguous even when the
+    # executable path contains spaces; only fall back to tokenizing the command
+    # line when no argv0 was handed over.
+    argv0=${given_argv0//\\//}
+    argv0=${argv0%.[eE][xX][eE]}
+  elif fm_windows_command_arg "$args"; then
+    argv0=${FM_WIN_ARG//\\//}
+    argv0=${argv0%\"}
+    argv0=${argv0%.[eE][xX][eE]}
+  else
+    argv0=
+  fi
+  verdict=$(fm_agent_process_classify "$base" "$argv0" "$norm")
+  case "$verdict" in
+    agent) printf 'agent' ;;
+    shell) printf 'shell' ;;
+    *) printf 'other' ;;
+  esac
+}
+
+# True when <state> says the pane shell is sleeping or idle: POSIX ps answers
+# S/I, a Windows host answers the main thread's ThreadState, where an idle
+# prompt sits in Wait/Ready/Standby and a shell still computing is Running.
+# Every other value fails closed.
+fm_backend_herdr_shell_state_is_idle() {  # <state>
+  local state=$1
+  [ -n "$state" ] || return 1
+  if fm_backend_herdr_uses_windows_proc_table; then
+    case "$state" in Wait|Ready|Standby|Initialized) return 0 ;; esac
+    return 1
+  fi
+  case "$state" in [SI]*) return 0 ;; esac
+  return 1
+}
+
+# Deliver <HUP|TERM|KILL> to the pane shell pid Herdr reported. POSIX hosts keep
+# the plain kill. A Windows host bridges through taskkill, the only primitive
+# that reaches a native pid, and returns non-zero when nothing was delivered so
+# the caller keeps its existing "signaled, now confirm the pane is gone" flow.
+fm_backend_herdr_signal_pane_shell() {  # <HUP|TERM|KILL> <pid>
+  local signal=$1 pid=$2
+  case "$signal" in HUP|TERM|KILL) ;; *) return 1 ;; esac
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if ! fm_backend_herdr_uses_windows_proc_table; then
+    kill "-$signal" "$pid" 2>/dev/null
+    return $?
+  fi
+  command -v taskkill >/dev/null 2>&1 || return 1
+  if [ "$signal" = KILL ]; then
+    taskkill -F -PID "$pid" >/dev/null 2>&1
+    return $?
+  fi
+  taskkill -PID "$pid" >/dev/null 2>&1
+  return $?
+}
+
 # fm_backend_herdr_death_close_pane: end the exact pane's proved lone idle
 # shell so Herdr removes the emptied workspace through its focus-preserving
 # pane-death path, then confirm the pane is gone.
@@ -1369,7 +1581,7 @@ fm_backend_herdr_death_close_pane() {  # <session> <pane-id> <shell-pid> [guard-
   max_attempts=${FM_BACKEND_HERDR_DEATH_CLOSE_POLLS:-40}
   fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$shell_pid" || return 1
   [ -z "$guard_tab" ] || fm_backend_herdr_projection_target_tab_mutation_allowed "$session" "$guard_tab" || return 1
-  kill -HUP "$shell_pid" 2>/dev/null || true
+  fm_backend_herdr_signal_pane_shell HUP "$shell_pid" || true
   attempt=0
   while [ "$attempt" -lt "$max_attempts" ]; do
     presence=$(fm_backend_herdr_pane_presence_state "$session" "$pane_id")
@@ -1384,7 +1596,7 @@ fm_backend_herdr_death_close_pane() {  # <session> <pane-id> <shell-pid> [guard-
   [ "$resampled_pid" = "$shell_pid" ] || return 1
   fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$shell_pid" || return 1
   [ -z "$guard_tab" ] || fm_backend_herdr_projection_target_tab_mutation_allowed "$session" "$guard_tab" || return 1
-  kill -KILL "$shell_pid" 2>/dev/null || true
+  fm_backend_herdr_signal_pane_shell KILL "$shell_pid" || true
   attempt=0
   while [ "$attempt" -lt "$max_attempts" ]; do
     presence=$(fm_backend_herdr_pane_presence_state "$session" "$pane_id")
@@ -1399,9 +1611,18 @@ fm_backend_herdr_death_close_pane() {  # <session> <pane-id> <shell-pid> [guard-
 # recognized shell process per <ps-bin>.
 # BSD ps reports comm as argv0, so a login shell arrives as "-zsh"; strip the
 # login dash exactly like the idle-shell proof's argv0 normalization.
+# A Windows host reads the same fact from fm_backend_herdr_windows_proc_table,
+# because its native pid space is invisible to Cygwin ps.
 fm_backend_herdr_pid_is_bare_shell() {  # <ps-bin> <pid>
   local comm
-  comm=$("$1" -p "$2" -o comm= 2>/dev/null) || return 1
+  case "$2" in ''|*[!0-9]*) return 1 ;; esac
+  if fm_backend_herdr_uses_windows_proc_table; then
+    comm=$(fm_backend_herdr_windows_proc_table \
+      | awk -F'\t' -v pid="$2" '$1 == pid { print $3; exit }')
+    [ -n "$comm" ] || return 1
+  else
+    comm=$("$1" -p "$2" -o comm= 2>/dev/null) || return 1
+  fi
   comm=$(printf '%s' "$comm" | tr -d '[:space:]')
   comm=${comm#-}
   comm=${comm##*/}
@@ -1465,22 +1686,63 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
     | ($process.argv0 // $process.argv[0])
     | select(type == "string" and length > 0)
   ' 2>/dev/null) || return 1
+  # A Windows host reports native paths and executable names, so normalize the
+  # backslashes and the `.exe` suffix BEFORE the basename strip: Herdr answers
+  # argv0 as `D:\...\bash.exe`, whose separators are backslashes and whose
+  # name carries the suffix, and both would otherwise disagree with the
+  # recognized-shell vocabulary and with each other.
+  if fm_backend_herdr_windows_host; then
+    name=${name//\\//}
+    argv0=${argv0//\\//}
+  fi
   shell_name=${name##*/}
   argv0=${argv0#-}
   argv0=${argv0##*/}
+  shell_name=${shell_name%.[eE][xX][eE]}
+  argv0=${argv0%.[eE][xX][eE]}
   [ "$argv0" = "$shell_name" ] || return 1
   case "$shell_name" in sh|bash|zsh|dash|ksh|fish) ;; *) return 1 ;; esac
 
-  ps_bin=${FM_HERDR_PS_BIN:-ps}
-  command -v "$ps_bin" >/dev/null 2>&1 || return 1
-  rows=$("$ps_bin" -axo pid=,ppid= 2>/dev/null) || return 1
-  printf '%s\n' "$rows" | awk -v shell="$shell_pid" '
-    $1 == shell { found++ }
-    $2 == shell { child++ }
-    END { exit(found == 1 && child == 0 ? 0 : 1) }
-  ' || return 1
-  stat=$("$ps_bin" -p "$shell_pid" -o stat= 2>/dev/null | tr -d '[:space:]') || return 1
-  case "$stat" in S*|I*) ;; *) return 1 ;; esac
+  # The process-table half of the proof. A Windows host reads the table, the
+  # shell's state, and its child set from one native snapshot, because Cygwin ps
+  # rejects the `-o` field syntax and its pid space is not Herdr's.
+  if fm_backend_herdr_uses_windows_proc_table; then
+    rows=$(fm_backend_herdr_windows_proc_table) || return 1
+    stat=$(printf '%s\n' "$rows" | awk -F'\t' -v pid="$shell_pid" '$1 == pid { print $5; exit }')
+    # Git for Windows runs an interactive tab shell as `bin\bash.exe` (the
+    # launcher Herdr reports) executing the real `usr\bin\bash.exe` as its only
+    # child, so the pane's shell may carry exactly one leaf child that is itself
+    # a recognized shell. Anything else under it - a harness process, or a shell
+    # that spawned anything at all - keeps the proof refused, so a backgrounded
+    # agent can never pass as a lone idle shell.
+    printf '%s\n' "$rows" | awk -F'\t' -v shell="$shell_pid" '
+      $1 == shell { found++ }
+      $2 == shell { child[$1] = 1; children++ }
+      { comm[$1] = $3; parent[$1] = $2 }
+      END {
+        if (found != 1) exit 1
+        if (children == 0) exit 0
+        if (children > 1) exit 1
+        for (c in child) {
+          if (comm[c] !~ /^(sh|bash|zsh|dash|ksh|fish)$/) exit 1
+          for (p in parent) if (parent[p] == c) exit 1
+          exit 0
+        }
+        exit 1
+      }
+    ' || return 1
+  else
+    ps_bin=${FM_HERDR_PS_BIN:-ps}
+    command -v "$ps_bin" >/dev/null 2>&1 || return 1
+    rows=$("$ps_bin" -axo pid=,ppid= 2>/dev/null) || return 1
+    stat=$("$ps_bin" -p "$shell_pid" -o stat= 2>/dev/null | tr -d '[:space:]') || return 1
+    printf '%s\n' "$rows" | awk -v shell="$shell_pid" '
+      $1 == shell { found++ }
+      $2 == shell { child++ }
+      END { exit(found == 1 && child == 0 ? 0 : 1) }
+    ' || return 1
+  fi
+  fm_backend_herdr_shell_state_is_idle "$stat" || return 1
   printf '%s\n' "$shell_pid"
 }
 
@@ -2206,7 +2468,14 @@ fm_backend_herdr_pane_process_state_sample() {  # <session> <pane_id>
     args=$(printf '%s' "$info" | jq -r --argjson i "$i" '
       .result.process_info.foreground_processes[$i] as $p
       | $p.cmdline // (($p.argv // []) | join(" ")) // empty' 2>/dev/null)
-    verdict=$(fm_agent_process_classify "$name" "$argv0" "$args" "$pid")
+    if fm_backend_herdr_windows_host; then
+      # Herdr reports native Windows names and command lines here, so identity
+      # comes from the session-lock owner's verified Windows matcher rather
+      # than from the POSIX ps-shaped surfaces.
+      verdict=$(fm_backend_herdr_windows_process_verdict "$name" "$args" "$argv0")
+    else
+      verdict=$(fm_agent_process_classify "$name" "$argv0" "$args" "$pid")
+    fi
     case "$verdict" in
       agent) printf 'agent'; return 0 ;;
       shell) ;;
@@ -2221,6 +2490,55 @@ fm_backend_herdr_pane_process_state_sample() {  # <session> <pane_id>
   # descendant of the pane shell outside the foreground group; only its
   # absence, read from the real process table, is proof of an agent-free pane.
   [ "$others" -eq 0 ] || { printf 'other'; return 0; }
+  if fm_backend_herdr_uses_windows_proc_table; then
+    # One native snapshot supplies the rows, every descendant's command line,
+    # and the shell's own presence: Cygwin ps cannot answer any of the three
+    # against Herdr's native pid space.
+    rows=$(fm_backend_herdr_windows_proc_table) || { printf 'unreadable'; return 0; }
+    printf '%s\n' "$rows" | awk -v shell="$shell_pid" '$1 == shell { found = 1 } END { exit(found ? 0 : 1) }' \
+      || { printf 'unreadable'; return 0; }
+    while IFS=$'\t' read -r pid name args; do
+      [ -n "$pid" ] || continue
+      if [ "$(fm_backend_herdr_windows_process_verdict "$name" "$args")" = agent ]; then
+        printf 'agent'
+        return 0
+      fi
+    done <<EOF
+$(printf '%s\n' "$rows" | awk -F'\t' -v shell="$shell_pid" '
+  { pid[NR] = $1; ppid[NR] = $2; comm[NR] = $3; args[NR] = $4 }
+  END {
+    want[shell] = 1
+    changed = 1
+    while (changed) {
+      changed = 0
+      for (n = 1; n <= NR; n++) {
+        if ((ppid[n] in want) && !(pid[n] in want)) { want[pid[n]] = 1; changed = 1 }
+      }
+    }
+    for (n = 1; n <= NR; n++) {
+      if ((pid[n] in want) && pid[n] != shell) printf "%s\t%s\t%s\n", pid[n], comm[n], args[n]
+    }
+  }')
+EOF
+    # Before claiming the pane is shell-only, honor the processes this pane
+    # cannot exclude: on this host a launcher that exits mid-chain orphans the
+    # harness it started, so an unattributable harness created after the pane
+    # shell keeps the pane out of the shell-only verdict. Such a process is
+    # reported as `agent`: that is the fail-safe direction (a false negative
+    # would let a live pane read as an agent-free husk), and it keeps the settle
+    # retry from re-reading a pane the table already shows is occupied.
+    while IFS=$'\t' read -r pid name args _start; do
+      [ -n "$pid" ] || continue
+      if [ "$(fm_backend_herdr_windows_process_verdict "$name" "$args")" = agent ]; then
+        printf 'agent'
+        return 0
+      fi
+    done <<EOF
+$(fm_backend_herdr_windows_unattributable_processes "$rows" "$shell_pid")
+EOF
+    printf 'shell'
+    return 0
+  fi
   ps_bin=${FM_HERDR_PS_BIN:-ps}
   command -v "$ps_bin" >/dev/null 2>&1 || { printf 'unreadable'; return 0; }
   rows=$(LC_ALL=C "$ps_bin" -axo pid=,ppid=,comm= 2>/dev/null) || { printf 'unreadable'; return 0; }
