@@ -179,17 +179,33 @@ write_executable() {
 # core.hooksPath makes that lookup fail, but plain git reads it as "no hooks",
 # so the wrapper runs none; any other failure reruns the lookup to show git's
 # error and refuses.
+#
+# "This launch's own hooks dir" is compared by directory identity, never by
+# string equality, because the path git hands a running hook is not always
+# spelled the way install wrote it: on Windows git rewrites a path-typed
+# core.hooksPath value to its native form (D:/... where install recorded the
+# MSYS form /d/...), and a symlinked or dot-segment alias does the same on any
+# host. A string compare missed both, so the entry was never dropped and the
+# resolved directory looked different from this one, which made the wrapper
+# exec itself - an unbounded exec chain that held the git command forever
+# (checkout, commit, and push all hung; the process churn also produced
+# MSYS fork failures). The chain depth marker is the backstop: whatever path
+# form an unrecognized alias takes, a wrapper entered from a chained hook
+# refuses to recurse instead of hanging.
 runtime_chain_body() {
   local ours=$1
   cat <<EOF
 ours=$(quote_for_hook "$ours")
+same_dir() {
+  [ -d "\$1" ] && [ -d "\$2" ] && [ "\$1" -ef "\$2" ]
+}
 case \${GIT_CONFIG_COUNT:-} in
 '' | *[!0-9]*) ;;
 *)
   count=\$((10#\$GIT_CONFIG_COUNT)) i=0 kept=0
   while [ "\$i" -lt "\$count" ]; do
     key=GIT_CONFIG_KEY_\$i value=GIT_CONFIG_VALUE_\$i
-    if [ "\${!key-}" != core.hooksPath ] || [ "\${!value-}" != "\$ours" ]; then
+    if [ "\${!key-}" != core.hooksPath ] || ! same_dir "\${!value-}" "\$ours"; then
       [ "\$i" = "\$kept" ] || export "GIT_CONFIG_KEY_\$kept=\${!key-}" "GIT_CONFIG_VALUE_\$kept=\${!value-}"
       kept=\$((kept + 1))
     fi
@@ -207,10 +223,15 @@ orig=\$(unset GIT_CONFIG_PARAMETERS; git rev-parse --path-format=absolute --git-
   echo "fm-git-strip-ai-trailers: cannot resolve this repository's hooks directory; refusing to skip its \$name hook" >&2
   exit 1
 }
-if [ "\$orig" = "\$ours" ]; then
+if same_dir "\$orig" "\$ours"; then
   exit 0
 fi
 if [ -x "\$orig/\$name" ]; then
+  case \${FM_GIT_HOOK_CHAIN:-} in
+  '') ;;
+  *) exit 0 ;;
+  esac
+  export FM_GIT_HOOK_CHAIN=1
   exec "\$orig/\$name" "\$@"
 fi
 EOF

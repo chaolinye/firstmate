@@ -17,6 +17,9 @@ unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_PARAMETERS
 STRIP="$ROOT/bin/fm-git-strip-ai-trailers.sh"
 TMP_ROOT=$(fm_test_tmproot fm-git-strip-ai-trailers)
 
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$ROOT/bin/fm-timeout-lib.sh"
+
 fm_git_identity 'Captain Tests' 'captain@example.invalid'
 
 with_hooks_env() {  # <hooks-dir> <command...>
@@ -94,7 +97,7 @@ test_hook_manager_cannot_displace_the_strip() {
   hooks="$TMP_ROOT/hooks-manager"
   "$STRIP" install "$hooks" "$repo" || fail "install should succeed"
   target=$(with_hooks_env "$hooks" git -C "$repo" rev-parse --path-format=absolute --git-path hooks)
-  [ "$target" = "$hooks" ] || fail "a hook manager in the pane would resolve $target, not the strip dir $hooks"
+  [ "$target" -ef "$hooks" ] || fail "a hook manager in the pane would resolve $target, not the strip dir $hooks"
   mv "$target/commit-msg" "$target/commit-msg.old" 2>/dev/null &&
     fail "a hook manager could rename the strip's commit-msg aside"
   (printf '#!/bin/sh\nexit 0\n' >"$target/commit-msg") 2>/dev/null &&
@@ -232,6 +235,59 @@ test_pane_hookspath_does_not_reroute_another_repository() {
   [ -f "$other/task-pre-commit.ran" ] && fail "the task worktree's pre-commit ran inside another repository"
   [ -f "$repo/task-pre-commit.ran" ] && fail "the task worktree's pre-commit ran while committing elsewhere"
   pass "a pane GIT_CONFIG hooksPath still chains the repository git is actually in"
+}
+
+# A spelling of <dir> that names the same directory but is not the text install
+# recorded. Where the host can report git's native form, that is the divergence
+# a Windows pane really sees; elsewhere a trailing dot segment stands in, which
+# a raw string compare also fails to match.
+foreign_spelling() {  # <dir>
+  local dir=$1 native
+  native=$(cygpath -m "$dir" 2>/dev/null) || native=
+  case "$native" in
+  [A-Za-z]:/*) printf '%s' "$native" ;;
+  *) printf '%s/.' "$dir" ;;
+  esac
+}
+
+# git hands a running hook the path it derived from its own config, which need
+# not be spelled the way install recorded it. The wrapper must recognize its
+# own directory by identity, return at once, and still chain the repository's
+# own hook; a string compare instead exec'd itself and held the git command
+# forever, which is how a checkout, commit, or push in a fleet pane hung.
+test_own_hooks_dir_recognized_across_path_spellings() {
+  local repo hooks foreign rc
+  repo="$TMP_ROOT/spelling"
+  make_repo "$repo"
+  write_marker_hook "$repo/.git/hooks/pre-commit" repo-pre-commit
+  hooks="$TMP_ROOT/hooks-spelling"
+  "$STRIP" install "$hooks" "$repo" || fail "install should succeed"
+  foreign=$(foreign_spelling "$hooks")
+  rc=0
+  (cd "$repo" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$foreign" \
+    fm_run_timed 20 "$hooks/pre-commit") || rc=$?
+  [ "$rc" -eq 0 ] || fail "the wrapper returned $rc instead of at once for its own directory spelled $foreign"
+  [ -f "$repo/repo-pre-commit.ran" ] || fail "the repository's own pre-commit hook did not run for $foreign"
+  pass "a wrapper recognizes its own directory however the inherited value spells it"
+}
+
+# The depth marker is the backstop for any path form the identity check cannot
+# recognize: a wrapper entered from a chained hook stops rather than recursing.
+test_a_chained_wrapper_refuses_to_recurse() {
+  local repo hooks parent rc
+  repo="$TMP_ROOT/chain-depth"
+  make_repo "$repo"
+  parent="$TMP_ROOT/hooks-depth-parent"
+  mkdir -p "$parent"
+  write_marker_hook "$parent/pre-commit" parent-pre-commit
+  hooks="$TMP_ROOT/hooks-depth"
+  "$STRIP" install "$hooks" "$repo" || fail "install should succeed"
+  rc=0
+  (cd "$repo" && FM_GIT_HOOK_CHAIN=1 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath \
+    GIT_CONFIG_VALUE_0="$parent" fm_run_timed 20 "$hooks/pre-commit") || rc=$?
+  [ "$rc" -eq 0 ] || fail "a wrapper entered from a chained hook returned $rc instead of stopping"
+  [ -f "$repo/parent-pre-commit.ran" ] && fail "a chained wrapper re-entered the chain instead of stopping"
+  pass "a wrapper entered from a chained hook stops instead of recursing"
 }
 
 test_empty_project_hookspath_runs_no_repository_hook() {
@@ -505,6 +561,8 @@ test_relative_project_hookspath_still_runs
 test_inherited_hookspath_env_does_not_decide_the_chain
 test_project_hook_generated_after_install_still_runs
 test_pane_hookspath_does_not_reroute_another_repository
+test_own_hooks_dir_recognized_across_path_spellings
+test_a_chained_wrapper_refuses_to_recurse
 test_empty_project_hookspath_runs_no_repository_hook
 test_unresolvable_project_hookspath_still_refuses
 test_valueless_project_hookspath_still_refuses
